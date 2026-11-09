@@ -1,0 +1,169 @@
+#!/bin/sh
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Copyright (c) 2026 Pouria Mousavizadeh Tehrani <pouria@FreeBSD.org>
+
+# PROVIDE: stampd
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# stampd, the STAMP Session-Reflector (RFC 8762): one a FIB, each FIB
+# of stampd_fibs, run by rc.subr(8) with stampd_fib set to it (setfib
+# -F), its pidfile ${stampd_rundir}/fib<N>.pid.
+#
+# stampd_enable (bool):	YES to run it.  Default NO.
+# stampd_fibs (str):	The FIBs, by number.  Default "0".
+# stampd_flags (str):	stampd(8)'s flags, each instance's.
+# stampd_rundir (str):	Its pidfiles.  Default /var/run/stampd.
+#
+# reload starts the instances of FIBs listed that do not run, stops
+# those of FIBs no longer listed, and sends the others SIGHUP: they read
+# stampd.conf again, their sessions kept.  With
+# net.inet.udp.bind_all_fibs 1, FIB 0's socket hears every FIB and no
+# other binds the port: FIB 0's alone is run.
+
+. /etc/rc.subr
+
+name=stampd
+rcvar=stampd_enable
+desc="STAMP Session-Reflector"
+
+load_rc_config $name
+
+: ${stampd_enable:=NO}
+: ${stampd_fibs:=0}
+: ${stampd_rundir:=/var/run/stampd}
+# As run_rc_command would set it: check_pidfile asks for it before.
+: ${stampd_svcj:=${svcj_all_enable:-NO}}
+
+command=%%PREFIX%%/sbin/stampd
+extra_commands=reload
+
+# The FIBs to run in: numbers below net.fibs, each once; FIB 0 alone
+# when one socket hears every FIB.
+stampd_wanted()
+{
+	local f n out
+
+	n=$(sysctl -n net.fibs 2>/dev/null || echo 1)
+	out=
+	for f in $(echo "${stampd_fibs}" | tr ',' ' '); do
+		case "$f" in
+		''|*[!0-9]*)
+			warn "stampd_fibs: \"$f\" is not a FIB"
+			continue ;;
+		esac
+		if [ "$f" -ge "$n" ]; then
+			warn "stampd_fibs: FIB $f: net.fibs is $n"
+			continue
+		fi
+		case " $out " in *" $f "*) ;; *) out="${out:+$out }$f" ;; esac
+	done
+	if [ -n "$out" -a "$out" != 0 ] &&
+	    [ "$(sysctl -n net.inet.udp.bind_all_fibs 2>/dev/null)" = 1 ]; then
+		warn "net.inet.udp.bind_all_fibs is 1: FIB 0's stampd" \
+		    "answers for every FIB (stampd_fibs: ${stampd_fibs})"
+		out=0
+	fi
+	echo $out
+}
+
+# The FIBs an instance runs in, by its pidfile.
+stampd_running()
+{
+	local pf f out
+
+	out=
+	for pf in ${stampd_rundir}/fib*.pid; do
+		[ -f "$pf" ] || continue
+		f=${pf##*/fib}
+		f=${f%.pid}
+		[ -n "$(check_pidfile "$pf" "${stampd_program:-$command}")" ] &&
+		    out="${out:+$out }$f"
+	done
+	echo $out
+}
+
+# One instance, rc.subr's way: verb $1, FIB $2.
+stampd_one()
+{
+	stampd_fib=$2
+	pidfile=${stampd_rundir}/fib$2.pid
+	command_args="-P ${pidfile}"
+	run_rc_command "$1"
+}
+
+stampd_rundir_make()
+{
+	[ -d "${stampd_rundir}" ] ||
+	    install -d -m 0755 "${stampd_rundir}" || return 1
+}
+
+# rc.subr's prefixes (one, fast, force, quiet) kept for each instance.
+_verb=$1
+_pfx=
+for _v in restart start stop status reload; do
+	case "$1" in
+	*$_v)	_verb=$_v; _pfx=${1%$_v}; break ;;
+	esac
+done
+
+case "$_verb" in
+start)
+	stampd_rundir_make || exit 1
+	_rc=0
+	for _f in $(stampd_wanted); do
+		stampd_one ${_pfx}start $_f || _rc=1
+	done
+	exit $_rc ;;
+stop)
+	_rc=0
+	for _f in $(stampd_running); do
+		stampd_one ${_pfx}stop $_f || _rc=1
+	done
+	exit $_rc ;;
+restart)
+	for _f in $(stampd_running); do
+		stampd_one ${_pfx}stop $_f
+	done
+	stampd_rundir_make || exit 1
+	_rc=0
+	for _f in $(stampd_wanted); do
+		stampd_one ${_pfx}start $_f || _rc=1
+	done
+	exit $_rc ;;
+status)
+	_rc=0
+	_up=$(stampd_running)
+	for _f in $(stampd_wanted) $_up; do
+		case " $_seen " in *" $_f "*) continue ;; esac
+		_seen="$_seen $_f"
+		case " $_up " in
+		*" $_f "*)	stampd_one ${_pfx}status $_f ;;
+		*)		echo "${name} is not running in FIB $_f."
+				_rc=1 ;;
+		esac
+	done
+	exit $_rc ;;
+reload)
+	stampd_rundir_make || exit 1
+	_want=$(stampd_wanted)
+	_up=$(stampd_running)
+	_rc=0
+	for _f in $_up; do
+		case " $_want " in
+		*" $_f "*)	;;
+		*)		stampd_one ${_pfx}stop $_f || _rc=1 ;;
+		esac
+	done
+	for _f in $_want; do
+		case " $_up " in
+		*" $_f "*)	stampd_one ${_pfx}reload $_f || _rc=1 ;;
+		*)		stampd_one ${_pfx}start $_f || _rc=1 ;;
+		esac
+	done
+	exit $_rc ;;
+*)
+	run_rc_command "$1" ;;
+esac

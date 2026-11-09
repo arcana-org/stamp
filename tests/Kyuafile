@@ -1,0 +1,5 @@
+-- The stamp test suite:  kyua test -k /usr/local/tests/stamp/Kyuafile
+syntax(2)
+test_suite("stamp")
+include("libstamp/Kyuafile")
+include("stampd/Kyuafile")

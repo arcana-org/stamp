@@ -1,0 +1,111 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Pouria Mousavizadeh Tehrani <pouria@FreeBSD.org>
+.\"
+.Dd November 10, 2026
+.Dt STAMP 1
+.Os
+.Sh NAME
+.Nm stamp
+.Nd send STAMP test packets
+.Sh SYNOPSIS
+.Nm
+.Op Fl c Ar count
+.Op Fl i Ar interval
+.Op Fl l Ar length
+.Op Fl p Ar port
+.Op Fl q Ar seq
+.Op Fl S Ar sport
+.Op Fl s Ar ssid
+.Op Fl t Ar ttl
+.Op Fl W Ar wait
+.Ar host
+.Sh DESCRIPTION
+.Nm
+is a minimal Session-Sender of the Simple Two-way Active Measurement
+Protocol (STAMP, RFC 8762) with RFC 8972's Session-Sender Identifier,
+for tests and by hand.
+It sends
+.Ar count
+test packets to the Session-Reflector at
+.Ar host ,
+such as
+.Xr stampd 8 ,
+each after the reply to the one before or its wait, and prints a line
+for each reply, or
+.Ql none
+for one that did not come.
+It sends in the FIB it runs in
+.Pq Xr setfib 1 .
+.Pp
+The options are as follows:
+.Bl -tag -width "-i interval"
+.It Fl c Ar count
+Packets to send; default 1.
+.It Fl i Ar interval
+Seconds from one packet to the next; default 1.
+.It Fl l Ar length
+The packet's length; default 44, the base.
+A longer one is padded with a pattern, which must come back; a shorter
+one is no STAMP packet (a TWAMP Light sender's bare 14 octets) and
+must not be answered.
+.It Fl p Ar port
+The reflector's UDP port; default 862.
+.It Fl q Ar seq
+The first sequence number; default 0.
+.It Fl S Ar sport
+The UDP port to send from; default any.
+.It Fl s Ar ssid
+The Session-Sender Identifier; default 0.
+.It Fl t Ar ttl
+The packets' TTL or hop limit; default the system's.
+.It Fl W Ar wait
+Seconds to wait for a reply; default 2.
+.El
+.Pp
+A reply's line has these fields:
+.Bl -tag -width "echo=ok"
+.It Cm len
+Its length.
+.It Cm from
+The address it came from.
+.It Cm seq , ssid , sseq
+The reflector's sequence number, the SSID, and the sender's sequence
+number echoed.
+.It Cm ttl , rttl
+The TTL the packet reached the reflector with, and the reply's.
+.It Cm echo
+The sender's timestamp and error estimate came back.
+.It Cm order
+The reflector received it (T2) no later than it replied (T3).
+.It Cm clock
+Both within 5 seconds of this host's clock.
+.It Cm serr
+The reflector's error estimate has a multiplier.
+.It Cm mbz
+Its MBZ octets are zero.
+.It Cm pad
+It is as long as the packet, what followed the base come back.
+.It Cm rtt , fwd , back
+Milliseconds: the round trip less the reflector's time, (T4 \- T1) \-
+(T3 \- T2); and, by the two clocks, the way out (T2 \- T1) and back
+(T4 \- T3).
+.El
+.Pp
+With a count above 1, a last line says the packets sent and received,
+and the round trips' least, mean and most.
+.Sh EXIT STATUS
+.Nm
+exits 0 when a reply came, 2 when none did, and 1 on an error.
+.Sh EXAMPLES
+.Bd -literal -offset indent
+$ stamp -c 3 192.0.2.1
+$ setfib 1 stamp -s 7 -l 200 2001:db8::1
+.Ed
+.Sh SEE ALSO
+.Xr setfib 1 ,
+.Xr libstamp 3 ,
+.Xr stampd 8
+.Sh AUTHORS
+.An Pouria Mousavizadeh Tehrani Aq Mt pouria@FreeBSD.org

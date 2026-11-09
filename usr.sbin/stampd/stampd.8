@@ -1,0 +1,217 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Pouria Mousavizadeh Tehrani <pouria@FreeBSD.org>
+.\"
+.Dd November 10, 2026
+.Dt STAMPD 8
+.Os
+.Sh NAME
+.Nm stampd
+.Nd STAMP Session-Reflector
+.Sh SYNOPSIS
+.Nm
+.Op Fl d
+.Op Fl f Ar file
+.Op Fl m Cm stateless | stateful
+.Op Fl P Ar pidfile
+.Op Fl p Ar port
+.Op Fl R Ar rate
+.Op Fl r Ar rate Ns Op / Ns Ar burst
+.Op Fl u Ar user
+.Sh DESCRIPTION
+.Nm
+is a Session-Reflector of the Simple Two-way Active Measurement
+Protocol (STAMP, RFC 8762), unauthenticated, with the Session-Sender
+Identifier of RFC 8972; it also answers a TWAMP Light Session-Sender
+(RFC 5357 Appendix I) that pads its packets to 44 octets.
+It listens on UDP
+.Ar port
+(862) of every address, IPv4 and IPv6, in the FIB it is started in
+.Pq Xr setfib 1 :
+one
+.Nm
+a FIB, as its
+.Xr rc 8
+script runs them.
+.Pp
+The time a packet came in is the kernel's
+.Pq Dv SO_TIMESTAMP No with Dv SO_TS_REALTIME ;
+the time its reply leaves,
+.Xr clock_gettime 2 Ns 's
+just before it is sent; both in NTP's format, the error estimate from
+.Xr ntp_gettime 2 .
+The TTL or hop limit the packet came with is reported, and the reply
+leaves from the address the packet came to, with TTL 255.
+.Pp
+It is no amplifier: a packet shorter than 44 octets, RFC 8762's base,
+is not answered, and a reply is exactly as long as its packet, what
+follows the base (padding, TLVs) copied.
+Nor is a packet from port 0 or from
+.Ar port
+answered, nor one over the rate limits; those are dropped silently,
+their count logged when it has grown, every 5 seconds at most.
+.Pp
+Bound,
+.Nm
+writes its pidfile and, run by root, gives up root: it changes its
+root to
+.Pa /var/empty
+and runs as
+.Ar user
+(and its group).
+.Pp
+The options are as follows:
+.Bl -tag -width "-r rate[/burst]"
+.It Fl d
+Stay in the foreground and log to the standard error too, debugging
+messages among them.
+.It Fl f Ar file
+The configuration file; it must be there.
+Without
+.Fl f ,
+.Pa /usr/local/etc/stampd.conf
+is read when it is there.
+.It Fl m Cm stateless | stateful
+.Cm stateless
+copies the sender's sequence number into the reply;
+.Cm stateful ,
+the default, counts the packets reflected in each session (RFC 8762
+section 4.3.2): a session the FIB, the sender's address and port, the
+address the packet came to, and the SSID, so that the sender tells
+loss on the way out from loss on the way back.
+A session ends after 300 seconds without a packet; 4096 are kept at
+most, the oldest replaced.
+.It Fl P Ar pidfile
+Where to write the process ID.
+.It Fl p Ar port
+The UDP port; default 862.
+.It Fl R Ar rate
+Replies a second to all sources together, its burst as many; default
+2000, 0 for no limit.
+.It Fl r Ar rate Ns Op / Ns Ar burst
+Replies a second to one source address, a token bucket each, and the
+burst it allows; default 50/100, the burst twice the rate when not
+given, 0 for no limit.
+The buckets are a table of 4096 keyed by a secret hash, a new source
+taking the oldest of its set, so that no sender chooses whom it
+displaces.
+.It Fl u Ar user
+The user it runs as once bound, when started by root; default
+.Ql _stampd .
+.El
+.Sh CONFIGURATION
+The configuration file has a setting a line, a word and its value,
+.Ql #
+starting a comment:
+.Bl -tag -width "rate-total rate"
+.It Cm mode Cm stateless | stateful
+As
+.Fl m .
+.It Cm rate Ar rate Ns Op / Ns Ar burst
+As
+.Fl r .
+.It Cm rate-total Ar rate
+As
+.Fl R .
+.El
+.Pp
+What the command line sets is kept over the file's.
+.Sh SIGNALS
+.Bl -tag -width SIGTERM
+.It Dv SIGHUP
+Read the configuration file again; its sessions are kept unless it
+becomes stateless.
+A file that cannot be read, or has an error, is logged and the
+configuration kept.
+.It Dv SIGTERM , SIGINT
+Log the drops and stop.
+.El
+.Sh RC.CONF VARIABLES
+The
+.Xr rc 8
+script runs one
+.Nm
+for each FIB of
+.Va stampd_fibs ,
+each by
+.Xr rc.subr 8 Ns 's
+.Va stampd_fib
+.Pq Xr setfib 1 ,
+its pidfile
+.Pa /var/run/stampd/fib Ns Ar N Ns Pa .pid .
+.Bl -tag -width stampd_rundir
+.It Va stampd_enable
+.Dq YES
+to run it.
+.It Va stampd_fibs
+The FIBs, by number, separated by spaces or commas; default
+.Dq 0 .
+.It Va stampd_flags
+The flags of each.
+.It Va stampd_rundir
+Where the pidfiles are; default
+.Pa /var/run/stampd .
+.El
+.Pp
+.Ql service stampd reload
+starts those of FIBs listed that do not run, stops those of FIBs no
+longer listed, and sends the others
+.Dv SIGHUP .
+.Ss One socket for every FIB
+With
+.Va net.inet.udp.bind_all_fibs
+1 (a loader tunable), a socket of FIB 0 hears the packets of every
+FIB, its replies routed by FIB 0's table, and a socket of another FIB
+cannot bind the port: the script then runs FIB 0's alone, and says so.
+Set it to 0 in
+.Xr loader.conf 5
+for each FIB's own.
+.Sh FILES
+.Bl -tag -width /usr/local/etc/stampd.conf -compact
+.It Pa /usr/local/etc/stampd.conf
+The configuration file.
+.It Pa /var/run/stampd/
+The pidfiles of the instances the
+.Xr rc 8
+script runs.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh EXAMPLES
+A reflector in FIBs 0 and 1, by
+.Xr rc.conf 5 :
+.Bd -literal -offset indent
+sysrc stampd_enable=YES stampd_fibs="0 1"
+service stampd start
+.Ed
+.Pp
+One by hand, in FIB 2, stateless, in the foreground:
+.Bd -literal -offset indent
+setfib 2 stampd -d -m stateless
+.Ed
+.Sh SEE ALSO
+.Xr setfib 1 ,
+.Xr stamp 1 ,
+.Xr libstamp 3 ,
+.Xr rc.conf 5 ,
+.Xr rc.subr 8
+.Rs
+.%R RFC 8762
+.%T Simple Two-Way Active Measurement Protocol
+.%D March 2020
+.Re
+.Rs
+.%R RFC 8972
+.%T Simple Two-Way Active Measurement Protocol Optional Extensions
+.%D January 2021
+.Re
+.Sh AUTHORS
+.An Pouria Mousavizadeh Tehrani Aq Mt pouria@FreeBSD.org
+.Sh CAVEATS
+The authenticated mode is not implemented.
+The user
+.Ql _stampd
+is made by the package; built from the sources, make it with
+.Xr pw 8 :
+.Ql pw useradd _stampd -d /var/empty -s /usr/sbin/nologin .

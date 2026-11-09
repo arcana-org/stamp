@@ -1,0 +1,302 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026 Pouria Mousavizadeh Tehrani <pouria@FreeBSD.org>
+.\"
+.Dd November 10, 2026
+.Dt LIBSTAMP 3
+.Os
+.Sh NAME
+.Nm libstamp ,
+.Nm stamp_test_encode ,
+.Nm stamp_test_decode ,
+.Nm stamp_reflected_decode ,
+.Nm stamp_tlv_next ,
+.Nm stamp_ntp_put ,
+.Nm stamp_ntp_get ,
+.Nm stamp_ptp_put ,
+.Nm stamp_ptp_get ,
+.Nm stamp_ts_put ,
+.Nm stamp_ts_get ,
+.Nm stamp_ts_sub ,
+.Nm stamp_ee_make ,
+.Nm stamp_ee_seconds ,
+.Nm stamp_ee_clock ,
+.Nm stamp_refl_new ,
+.Nm stamp_refl_setconf ,
+.Nm stamp_refl_free ,
+.Nm stamp_refl_reply ,
+.Nm stamp_refl_send_time ,
+.Nm stamp_refl_expire ,
+.Nm stamp_refl_stats ,
+.Nm stamp_mono ,
+.Nm stamp_socket ,
+.Nm stamp_recv ,
+.Nm stamp_send ,
+.Nm stamp_sockaddr ,
+.Nm stamp_sa_port ,
+.Nm stamp_sa_ntop
+.Nd Simple Two-way Active Measurement Protocol
+.Sh LIBRARY
+STAMP Library
+.Pq libstamp, -lstamp
+.Sh SYNOPSIS
+.In stamp.h
+.Ft int
+.Fn stamp_test_encode "uint8_t *buf" "size_t len" "const struct stamp_test *t"
+.Ft int
+.Fn stamp_test_decode "const uint8_t *buf" "size_t len" "struct stamp_test *t"
+.Ft int
+.Fn stamp_reflected_decode "const uint8_t *buf" "size_t len" "struct stamp_reflected *r"
+.Ft int
+.Fn stamp_tlv_next "const uint8_t *pkt" "size_t len" "size_t *off" "struct stamp_tlv *tlv"
+.Ft void
+.Fn stamp_ntp_put "uint8_t *p" "const struct timespec *ts"
+.Ft void
+.Fn stamp_ntp_get "const uint8_t *p" "struct timespec *ts"
+.Ft void
+.Fn stamp_ptp_put "uint8_t *p" "const struct timespec *ts"
+.Ft void
+.Fn stamp_ptp_get "const uint8_t *p" "struct timespec *ts"
+.Ft void
+.Fn stamp_ts_put "uint8_t *p" "uint16_t ee" "const struct timespec *ts"
+.Ft void
+.Fn stamp_ts_get "const uint8_t *p" "uint16_t ee" "struct timespec *ts"
+.Ft double
+.Fn stamp_ts_sub "const struct timespec *a" "const struct timespec *b"
+.Ft uint16_t
+.Fn stamp_ee_make "bool synced" "bool ptp" "double err"
+.Ft double
+.Fn stamp_ee_seconds "uint16_t ee"
+.Ft uint16_t
+.Fn stamp_ee_clock "void"
+.Ft "struct stamp_refl *"
+.Fn stamp_refl_new "const struct stamp_refl_conf *c"
+.Ft int
+.Fn stamp_refl_setconf "struct stamp_refl *r" "const struct stamp_refl_conf *c"
+.Ft void
+.Fn stamp_refl_free "struct stamp_refl *r"
+.Ft ssize_t
+.Fn stamp_refl_reply "struct stamp_refl *r" "const struct stamp_rx *rx" "uint8_t *out" "size_t outlen" "enum stamp_drop *why"
+.Ft void
+.Fn stamp_refl_send_time "uint8_t *out" "const struct timespec *t3"
+.Ft void
+.Fn stamp_refl_expire "struct stamp_refl *r" "double mono"
+.Ft void
+.Fn stamp_refl_stats "const struct stamp_refl *r" "struct stamp_refl_stats *st"
+.Ft double
+.Fn stamp_mono "void"
+.Ft int
+.Fn stamp_socket "int af" "uint16_t port" "int flags"
+.Ft ssize_t
+.Fn stamp_recv "int fd" "uint8_t *buf" "size_t len" "struct stamp_rxinfo *ri"
+.Ft int
+.Fn stamp_send "int fd" "const uint8_t *buf" "size_t len" "const struct sockaddr *to" "const struct sockaddr *from" "unsigned ifindex"
+.Ft int
+.Fn stamp_sockaddr "const char *host" "uint16_t port" "struct sockaddr_storage *ss"
+.Ft uint16_t
+.Fn stamp_sa_port "const struct sockaddr *sa"
+.Ft "const char *"
+.Fn stamp_sa_ntop "const struct sockaddr *sa" "char *buf" "size_t len"
+.Sh DESCRIPTION
+The
+.Nm
+library implements the Simple Two-way Active Measurement Protocol
+(STAMP, RFC 8762) with the Session-Sender Identifier of RFC 8972:
+its packets in unauthenticated mode, its timestamps and error
+estimate, the Session-Reflector's core and the UDP socket of either
+end.
+It has no other dependency than the C library.
+The authenticated mode
+.Pq Dv STAMP_AUTH , No 112 octets and an HMAC
+is not implemented yet; the TLVs that follow the base packet are
+read by
+.Fn stamp_tlv_next
+and otherwise carried as they are.
+.Ss Packets
+.Fn stamp_test_encode
+writes a Session-Sender test packet
+.Pq Vt struct stamp_test : No sequence number, timestamp, error estimate, SSID
+into the first
+.Dv STAMP_UNAUTH_LEN
+(44) octets of
+.Fa buf ,
+its MBZ octets zero, what follows them as it is;
+.Fa len
+must be at least 44.
+.Fn stamp_test_decode
+reads one;
+.Fn stamp_reflected_decode
+reads a Session-Reflector's
+.Pq Vt struct stamp_reflected ,
+the sender's fields it echoes among them and whether its MBZ octets
+were zero.
+Each timestamp is read in the format its error estimate's Z bit says.
+.Fn stamp_tlv_next
+returns the TLV at
+.Fa *off
+(from the end of the base packet) and moves
+.Fa *off
+past it: 1, 0 when none is left, or \-1 with
+.Va errno
+.Er EBADMSG
+when one runs past the packet.
+.Ss Timestamps and the error estimate
+.Fn stamp_ntp_put
+and
+.Fn stamp_ntp_get
+convert a
+.Vt timespec
+of
+.Dv CLOCK_REALTIME
+to and from NTP's 64-bit format (RFC 5905), its era told by the top
+bit of the seconds as RFC 4330 does;
+.Fn stamp_ptp_put
+and
+.Fn stamp_ptp_get ,
+PTPv2's truncated format (seconds and nanoseconds), whose epoch is
+the caller's to choose.
+.Fn stamp_ts_put
+and
+.Fn stamp_ts_get
+choose by an error estimate's
+.Dv STAMP_EE_Z
+bit.
+.Fn stamp_ts_sub
+is
+.Fa a
+\-
+.Fa b
+in seconds.
+.Pp
+.Fn stamp_ee_make
+makes an error estimate (RFC 4656 section 4.1.2) of
+.Fa err
+seconds: the S bit when
+.Fa synced ,
+Z when
+.Fa ptp ,
+the least scale whose multiplier fits an octet, the multiplier
+rounded up and never 0.
+.Fn stamp_ee_seconds
+is the error an estimate says.
+.Fn stamp_ee_clock
+is the clock's, from
+.Xr ntp_gettime 2 :
+synchronised unless its state is
+.Dv TIME_ERROR ,
+the error its maximum error.
+.Ss The Session-Reflector
+.Fn stamp_refl_new
+makes a reflector of
+.Vt struct stamp_refl_conf :
+.Bl -tag -width rate_total
+.It Va stateful
+The reply's sequence number counts the packets of its session (RFC 8762
+section 4.3.2) rather than copying the sender's; a session is the
+caller's tag (a FIB), the sender's address and port, the address the
+packet came to and the SSID.
+.It Va rate , burst
+Replies a second to one source address, and the burst its token bucket
+allows (0: twice the rate); a rate of 0 sets no limit.
+The buckets are a table of 4096, four ways a set, keyed by a random
+secret, a new source taking its set's oldest.
+.It Va rate_total
+Replies a second to all sources, its burst as many; 0 none.
+.It Va sess_max , sess_idle
+Sessions kept at most
+.Pq Dv STAMP_SESS_MAX , No 4096 , No the oldest replaced
+and the seconds one ends after without a packet
+.Pq Dv STAMP_SESS_IDLE , No 300 ;
+0 for those.
+.It Va port
+The reflector's own port: a packet from it is not answered, nor one
+from port 0.
+.El
+.Pp
+.Fn stamp_refl_setconf
+changes it, its sessions kept while it stays stateful.
+.Fn stamp_refl_reply
+answers a packet as it came
+.Pq Vt struct stamp_rx : No the packet, the sender's address, the address it came to, the TTL it came with, the time it came Pq T2 ,
+the session's tag and a monotonic time (0: now) into
+.Fa out
+and returns the reply's length, always the packet's: what follows the
+base is copied.
+A packet shorter than the base, from port 0 or the reflector's own, or
+over a rate limit is not answered: \-1, why in
+.Fa *why
+.Pq Dv STAMP_DROP_SHORT , STAMP_DROP_PORT , STAMP_DROP_RATE ,
+counted.
+The caller sets the reply's own timestamp (T3) as late as it can with
+.Fn stamp_refl_send_time
+and sends it.
+.Fn stamp_refl_expire
+ends the sessions idle for
+.Va sess_idle ;
+.Fn stamp_refl_stats
+says the packets answered, those dropped by reason and the sessions.
+.Ss Sockets
+.Fn stamp_socket
+opens a non-blocking UDP socket of family
+.Fa af ,
+bound to
+.Fa port
+(0: any) on every address, an IPv6 one
+.Dv IPV6_V6ONLY ,
+in the process's FIB
+.Pq Xr setfib 2 ;
+the time a packet comes is the kernel's
+.Pq Dv SO_TIMESTAMP , SO_TS_REALTIME ,
+the TTL or hop limit and the address it came to said.
+.Dv STAMP_SOCK_REFLECTOR
+in
+.Fa flags
+sends with TTL 255.
+.Fn stamp_recv
+reads a packet and what came with it
+.Pq Vt struct stamp_rxinfo .
+.Fn stamp_send
+sends from the address
+.Fa from
+(the one a packet came to), the routes' own when that is not of an
+interface of the socket's FIB.
+.Fn stamp_sockaddr
+resolves a host and port;
+.Fn stamp_sa_port
+and
+.Fn stamp_sa_ntop
+read a socket address.
+.Sh RETURN VALUES
+The functions returning
+.Vt int
+or
+.Vt ssize_t
+return \-1 with
+.Va errno
+set on failure;
+.Fn stamp_refl_new
+returns
+.Dv NULL .
+.Sh SEE ALSO
+.Xr stamp 1 ,
+.Xr ntp_gettime 2 ,
+.Xr setfib 2 ,
+.Xr stampd 8
+.Rs
+.%R RFC 8762
+.%T Simple Two-Way Active Measurement Protocol
+.%D March 2020
+.Re
+.Rs
+.%R RFC 8972
+.%T Simple Two-Way Active Measurement Protocol Optional Extensions
+.%D January 2021
+.Re
+.Rs
+.%R RFC 4656
+.%T A One-way Active Measurement Protocol (OWAMP)
+.%D September 2006
+.Re
+.Sh AUTHORS
+.An Pouria Mousavizadeh Tehrani Aq Mt pouria@FreeBSD.org
