@@ -11,15 +11,19 @@
  * (RFC 8762 4.2.1): seconds and nanoseconds, of whatever epoch the
  * caller's timespec has.  The Error Estimate (RFC 4656 4.1.2): S, Z,
  * an 6-bit Scale and an 8-bit Multiplier, the error Multiplier *
- * 2^(Scale - 32) seconds.
+ * 2^(Scale - 32) seconds.  And the clock both are of: its Error
+ * Estimate and what it is synchronised by (RFC 8972 4.3's sources).
  */
 
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/timex.h>
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -148,15 +152,112 @@ stamp_ee_seconds(uint16_t ee)
 	return ((double)(ee & 0xff) * (double)(1ULL << scale) / 4294967296.0);
 }
 
-/* The clock's, from ntp_gettime(2): synchronised unless its state is
- * TIME_ERROR, the error its maxerror; NTP's format. */
+/* The clock's Error Estimate, stamp_clock_get()'s. */
 uint16_t
 stamp_ee_clock(void)
 {
-	struct ntptimeval	ntv;
+	struct stamp_clock	c;
 
-	if (ntp_gettime(&ntv) == -1)
-		return (stamp_ee_make(false, false, 16.0));
-	return (stamp_ee_make(ntv.time_state != TIME_ERROR, false,
-	    (double)ntv.maxerror / 1e6));
+	stamp_clock_get(&c);
+	return (c.ee);
+}
+
+/*
+ * The clock, as the process said it is (stamp_clock_set()), else as
+ * ntp_gettime(2) tells: synchronised unless its state is TIME_ERROR,
+ * the error its maxerror, by NTP (the kernel's PLL is told by ntpd or
+ * chrony; it cannot say PTP), free-running when not.  NTP's format.
+ */
+static bool	clk_set;
+static uint8_t	clk_sync;
+static double	clk_err;
+
+static const char *const sync_names[] = { "-", "ntp", "ptp", "ssu", "gnss",
+    "local" };
+static const char *const tsm_names[] = { "-", "hw", "sw", "cp" };
+
+void
+stamp_clock_get(struct stamp_clock *c)
+{
+	struct ntptimeval	ntv;
+	bool			synced;
+
+	if (clk_set) {
+		c->sync = clk_sync;
+		c->ee = stamp_ee_make(clk_sync != STAMP_SYNC_LOCAL, false,
+		    clk_err);
+		return;
+	}
+	if (ntp_gettime(&ntv) == -1) {
+		c->sync = STAMP_SYNC_LOCAL;
+		c->ee = stamp_ee_make(false, false, 16.0);
+		return;
+	}
+	synced = ntv.time_state != TIME_ERROR;
+	c->sync = synced ? STAMP_SYNC_NTP : STAMP_SYNC_LOCAL;
+	c->ee = stamp_ee_make(synced, false, (double)ntv.maxerror / 1e6);
+}
+
+/*
+ * The clock said, for one that ntp_gettime(2) does not know is
+ * synchronised (by PTP without the kernel's PLL, a GNSS receiver, or
+ * the one clock of a host whose ends are both on it): "source[:error]",
+ * the source ntp, ptp, ssu, gnss or local (free-running: not
+ * synchronised), the error in seconds (0 when not said: the least the
+ * Error Estimate says).  NULL: ntp_gettime(2)'s again.  0, or -1 with
+ * errno EINVAL.
+ */
+int
+stamp_clock_set(const char *spec)
+{
+	char		 buf[64], *colon, *end;
+	double		 err = 0;
+	unsigned	 i;
+
+	if (spec == NULL) {
+		clk_set = false;
+		return (0);
+	}
+	if (strlcpy(buf, spec, sizeof(buf)) >= sizeof(buf))
+		goto bad;
+	if ((colon = strchr(buf, ':')) != NULL) {
+		*colon++ = '\0';
+		err = strtod(colon, &end);
+		if (end == colon || *end != '\0' || !(err >= 0 && err <= 1000))
+			goto bad;
+	}
+	for (i = 1; i < sizeof(sync_names) / sizeof(sync_names[0]); i++)
+		if (strcmp(buf, sync_names[i]) == 0) {
+			clk_set = true;
+			clk_sync = (uint8_t)i;
+			clk_err = err;
+			return (0);
+		}
+bad:
+	errno = EINVAL;
+	return (-1);
+}
+
+/* A synchronisation source's name, and a timestamping method's: "-"
+ * for none, the number when not known. */
+const char *
+stamp_sync_name(uint8_t v)
+{
+	static char	buf[8];
+
+	if (v < sizeof(sync_names) / sizeof(sync_names[0]))
+		return (sync_names[v]);
+	(void)snprintf(buf, sizeof(buf), "%u", v);
+	return (buf);
+}
+
+const char *
+stamp_tsm_name(uint8_t v)
+{
+	static char	buf[8];
+
+	if (v < sizeof(tsm_names) / sizeof(tsm_names[0]))
+		return (tsm_names[v]);
+	(void)snprintf(buf, sizeof(buf), "%u", v);
+	return (buf);
 }

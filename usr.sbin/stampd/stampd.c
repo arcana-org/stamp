@@ -70,9 +70,10 @@ static void
 usage(void)
 {
 
-	fprintf(stderr, "usage: stampd [-d] [-f file] [-m stateless | stateful]"
-	    " [-P pidfile]\n"
-	    "              [-p port] [-r rate[/burst]] [-R rate] [-u user]\n");
+	fprintf(stderr, "usage: stampd [-d] [-C source[:error]] [-f file]"
+	    " [-m stateless | stateful]\n"
+	    "              [-P pidfile] [-p port] [-r rate[/burst]] [-R rate]"
+	    " [-u user]\n");
 	exit(1);
 }
 
@@ -252,6 +253,7 @@ reflect(int fd)
 		    (const struct sockaddr *)&ri.local : NULL;
 		rx.ttl = ri.ttl;
 		rx.t2 = ri.t;
+		rx.ts_in = ri.hwts ? STAMP_TSM_HW : STAMP_TSM_SW;
 		rx.tag = fib;
 		if ((n = stamp_refl_reply(refl, &rx, out, sizeof(out), NULL)) <
 		    0)
@@ -292,8 +294,13 @@ main(int argc, char *argv[])
 	int		 ch, kq, fds[2], nfds, i, n, port = STAMP_PORT, all;
 	bool		 debug = false;
 
-	while ((ch = getopt(argc, argv, "df:m:P:p:R:r:u:")) != -1)
+	while ((ch = getopt(argc, argv, "C:df:m:P:p:R:r:u:")) != -1)
 		switch (ch) {
+		case 'C':
+			if (stamp_clock_set(optarg) == -1)
+				errx(1, "-C %s: ntp, ptp, ssu, gnss or local, "
+				    "and :error in seconds", optarg);
+			break;
 		case 'd':
 			debug = true;
 			break;

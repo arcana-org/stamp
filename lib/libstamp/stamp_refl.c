@@ -22,7 +22,8 @@
  * A reflector answers whoever writes a source address, so it is no
  * amplifier and no firehose.  Only a packet of STAMP_UNAUTH_LEN octets
  * or more is answered, the reply exactly as long, what follows the
- * base copied (padding, TLVs).  Not one from port 0 nor from the
+ * base copied (padding, TLVs; the Timestamp Information TLV filled,
+ * those not known marked so).  Not one from port 0 nor from the
  * reflector's own port (two reflectors made to answer each other
  * forever by one forged packet).  And no more replies to one source
  * address than its token bucket allows, nor to all of them together
@@ -74,8 +75,8 @@ struct stamp_refl {
 	struct rl		 rl[RL_SLOTS];
 	uint32_t		 key;
 	double			 all_tokens, all_last;
-	uint16_t		 ee;
-	double			 ee_at;
+	struct stamp_clock	 clk;
+	double			 clk_at;
 	struct stamp_refl_stats	 st;
 };
 
@@ -376,6 +377,43 @@ stamp_refl_stats(const struct stamp_refl *r, struct stamp_refl_stats *st)
 }
 
 /*
+ * The TLVs of a reply of len octets, copied from the request (RFC 8972
+ * 4): the Timestamp Information TLV filled (the clock's source, how T2
+ * and T3 are taken), any other but Extra Padding marked unrecognised
+ * (U).  What follows the base is TLVs only when it is TLVs to its end,
+ * none of type 0: anything else is a sender's padding (a TWAMP Light
+ * sender's zeros, a pattern), copied as it is.
+ */
+static void
+tlvs_reflect(uint8_t *out, size_t len, uint8_t sync, uint8_t ts_in,
+    uint8_t ts_out)
+{
+	struct stamp_tlv	v;
+	size_t			off, at;
+	int			rc;
+
+	off = STAMP_UNAUTH_LEN;
+	while ((rc = stamp_tlv_next(out, len, &off, &v)) == 1)
+		if (v.type == 0)
+			return;
+	if (rc == -1)
+		return;
+	off = STAMP_UNAUTH_LEN;
+	for (;;) {
+		at = off;
+		if (stamp_tlv_next(out, len, &off, &v) != 1)
+			break;
+		if (v.type == STAMP_TLV_TSINFO && v.len >= 4) {
+			out[at + 4] = sync;
+			out[at + 5] = ts_in;
+			out[at + 6] = sync;
+			out[at + 7] = ts_out;
+		} else if (v.type != STAMP_TLV_PAD)
+			out[at] |= STAMP_TLV_U;
+	}
+}
+
+/*
  * The reply to rx in out (outlen octets): its length, rx's, or -1 with
  * why it is not answered.  Its Timestamp (T3) is for the caller to set
  * last, with stamp_refl_send_time(), before it is sent.
@@ -432,19 +470,21 @@ stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
 	} else
 		memcpy(out, in, 4);
 	/* The Error Estimate, the clock's, looked at once a second. */
-	if (r->ee == 0 || now - r->ee_at >= 1) {
-		r->ee = stamp_ee_clock();
-		r->ee_at = now;
+	if (r->clk.ee == 0 || now - r->clk_at >= 1) {
+		stamp_clock_get(&r->clk);
+		r->clk_at = now;
 	}
-	out[12] = (uint8_t)(r->ee >> 8);
-	out[13] = (uint8_t)r->ee;
+	out[12] = (uint8_t)(r->clk.ee >> 8);
+	out[13] = (uint8_t)r->clk.ee;
 	out[14] = in[14];			/* SSID */
 	out[15] = in[15];
-	stamp_ts_put(out + 16, r->ee, &rx->t2);	/* Receive Timestamp */
+	stamp_ts_put(out + 16, r->clk.ee, &rx->t2);	/* Receive Timestamp */
 	memcpy(out + 24, in, 4);		/* Session-Sender Sequence */
 	memcpy(out + 28, in + 4, 8);		/* ... Timestamp */
 	memcpy(out + 36, in + 12, 2);		/* ... Error Estimate */
 	out[40] = (uint8_t)(rx->ttl > 0 ? rx->ttl : 0);	/* ... TTL */
+	tlvs_reflect(out, rx->len, r->clk.sync, rx->ts_in != 0 ? rx->ts_in :
+	    STAMP_TSM_SW, r->c.ts_out != 0 ? r->c.ts_out : STAMP_TSM_SW);
 	r->st.answered++;
 	return ((ssize_t)rx->len);
 }

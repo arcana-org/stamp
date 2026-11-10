@@ -6,12 +6,13 @@
 
 /*
  * libstamp: the Simple Two-way Active Measurement Protocol (RFC 8762),
- * with the Session-Sender Identifier of RFC 8972.  The packets of the
- * unauthenticated mode, the timestamps (NTP's 64-bit format and PTPv2's
- * truncated one) and the Error Estimate of RFC 4656, the reflector's
+ * with the Session-Sender Identifier and the Timestamp Information TLV
+ * of RFC 8972.  The packets of the unauthenticated mode, the timestamps
+ * (NTP's 64-bit format and PTPv2's truncated one) and the Error
+ * Estimate of RFC 4656, the clock's synchronisation, the reflector's
  * core (its sessions, its rate limits, its reply), the sender's (its
- * sequence, the replies matched, the round trip and the loss each way)
- * and the UDP socket both ends use.  See libstamp(3).
+ * sequence, the replies matched, the round trip, the delay and the
+ * loss each way) and the UDP socket both ends use.  See libstamp(3).
  */
 
 #ifndef _STAMP_H_
@@ -57,6 +58,29 @@ uint16_t stamp_ee_make(bool, bool, double);
 double	stamp_ee_seconds(uint16_t);
 uint16_t stamp_ee_clock(void);
 
+/* Synchronisation sources (RFC 8972 4.3, IANA's registry). */
+#define	STAMP_SYNC_NTP		1
+#define	STAMP_SYNC_PTP		2
+#define	STAMP_SYNC_SSU		3	/* SSU/BITS */
+#define	STAMP_SYNC_GNSS		4	/* GPS, GLONASS, Galileo, ... */
+#define	STAMP_SYNC_LOCAL	5	/* free-running */
+/* Timestamping methods (the same). */
+#define	STAMP_TSM_HW		1	/* hardware assisted */
+#define	STAMP_TSM_SW		2	/* software, local */
+#define	STAMP_TSM_CP		3	/* the control plane's */
+
+/* The clock as this end tells it: its Error Estimate and what it is
+ * synchronised by. */
+struct stamp_clock {
+	uint16_t	 ee;
+	uint8_t		 sync;		/* STAMP_SYNC_* */
+};
+
+void	stamp_clock_get(struct stamp_clock *);
+int	stamp_clock_set(const char *);
+const char *stamp_sync_name(uint8_t);
+const char *stamp_tsm_name(uint8_t);
+
 /* ---- Packets (unauthenticated mode) ----------------------------- */
 
 /* A Session-Sender test packet (RFC 8762 4.2.1, RFC 8972 3). */
@@ -97,7 +121,23 @@ struct stamp_tlv {
 #define	STAMP_TLV_M		0x40	/* malformed */
 #define	STAMP_TLV_I		0x20	/* integrity failed */
 
+/* TLV types (RFC 8972 4, IANA's registry). */
+#define	STAMP_TLV_PAD		1	/* Extra Padding */
+#define	STAMP_TLV_TSINFO	3	/* Timestamp Information */
+#define	STAMP_TLV_HDR		4
+#define	STAMP_TSINFO_LEN	8	/* the TLV, its header with it */
+
+/* The Timestamp Information TLV's value (RFC 8972 4.3): what the
+ * reflector's clock is synchronised by and how it took T2 (in) and T3
+ * (out). */
+struct stamp_tsinfo {
+	uint8_t		 sync_in, ts_in, sync_out, ts_out;
+};
+
 int	stamp_tlv_next(const uint8_t *, size_t, size_t *, struct stamp_tlv *);
+int	stamp_tlv_put(uint8_t *, size_t, size_t *, uint8_t, const void *,
+	    uint16_t);
+int	stamp_tsinfo_find(const uint8_t *, size_t, struct stamp_tsinfo *);
 
 /* ---- The Session-Reflector -------------------------------------- */
 
@@ -109,6 +149,7 @@ struct stamp_refl_conf {
 	unsigned	 sess_max;	/* 0: STAMP_SESS_MAX */
 	unsigned	 sess_idle;	/* s; 0: STAMP_SESS_IDLE */
 	uint16_t	 port;		/* its own: never answered */
+	uint8_t		 ts_out;	/* how T3 is taken; 0: STAMP_TSM_SW */
 };
 #define	STAMP_SESS_MAX		4096
 #define	STAMP_SESS_IDLE		300
@@ -123,6 +164,7 @@ struct stamp_rx {
 	struct timespec		 t2;
 	int			 tag;	/* of the session's key: a FIB */
 	double			 mono;	/* monotonic seconds; 0 now */
+	uint8_t			 ts_in;	/* how t2 was; 0: STAMP_TSM_SW */
 };
 
 /* Why a packet was not answered. */
@@ -168,7 +210,11 @@ struct stamp_sender_conf {
 	enum stamp_mode	 mode;		/* the reflector's, if known */
 	double		 timeout;	/* s a reply is waited; 0: 2 */
 	unsigned	 window;	/* in flight at most; 0: 256 */
+	bool		 tsinfo;	/* the Timestamp Information TLV */
+	double		 owd_frac;	/* one way: both errors to half the
+					   round trip at most; 0: 0.1 */
 };
+#define	STAMP_OWD_FRAC		0.1
 
 /* A packet's outcome: its reply, or none within the timeout. */
 struct stamp_sample {
@@ -176,6 +222,15 @@ struct stamp_sample {
 	bool			 lost;
 	double			 rtt;	/* s: (T4 - T1) - (T3 - T2) */
 	double			 refl;	/* s: T3 - T2, the reflector's time */
+	/* The delay each way: T2 - T1 and T4 - T3 when both clocks say
+	 * they are synchronised and their errors together are within
+	 * owd_frac of half the round trip (owd); else half the round
+	 * trip each, an estimate. */
+	double			 fwd, back;	/* s */
+	bool			 owd;
+	double			 err;	/* s: both Error Estimates' */
+	bool			 has_tsinfo;	/* the reflector filled it */
+	struct stamp_tsinfo	 tsinfo;
 	struct stamp_reflected	 r;	/* the reply, when not lost */
 };
 
@@ -198,7 +253,8 @@ void	stamp_sender_free(struct stamp_sender *);
 int	stamp_sender_packet(struct stamp_sender *, uint8_t *, size_t,
 	    const struct timespec *, double, struct stamp_sample *);
 int	stamp_sender_reply(struct stamp_sender *, const uint8_t *, size_t,
-	    double, struct stamp_sample *);
+	    double, const struct timespec *, struct stamp_sample *);
+size_t	stamp_sender_len(const struct stamp_sender *, size_t);
 int	stamp_sender_expire(struct stamp_sender *, double,
 	    struct stamp_sample *);
 double	stamp_sender_next(const struct stamp_sender *);
@@ -219,6 +275,7 @@ struct stamp_rxinfo {
 	int			 ttl;	/* -1 not said */
 	struct timespec		 t;	/* the kernel's, else the clock's */
 	struct timespec		 mono;	/* the same, monotonic */
+	bool			 hwts;	/* the kernel's by the hardware */
 	bool			 trunc;
 };
 

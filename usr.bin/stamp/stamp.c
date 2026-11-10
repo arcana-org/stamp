@@ -10,8 +10,11 @@
  * to host, one every interval whatever came back, each reply's fields
  * on a line of its own as key=value, "none" for one that did not come
  * within the wait; at the end the loss, each way when the reflector is
- * stateful.  A TWAMP Light sender's packet by -l (14 octets and its
- * padding).  In the FIB the process is in: setfib(1).
+ * stateful, and the delay each way, one way when both clocks allow,
+ * else half the round trip.  -T asks for the reflector's Timestamp
+ * Information TLV; -C says this clock's synchronisation.  A TWAMP
+ * Light sender's packet by -l (14 octets and its padding).  In the FIB
+ * the process is in: setfib(1).
  */
 
 #include <sys/types.h>
@@ -43,10 +46,11 @@ static void
 usage(void)
 {
 
-	fprintf(stderr, "usage: stamp [-c count] [-i interval] [-l length] "
-	    "[-m mode] [-p port]\n"
-	    "             [-q seq] [-S sport] [-s ssid] [-t ttl] [-W wait] "
-	    "host\n");
+	fprintf(stderr, "usage: stamp [-T] [-C source[:error]] [-c count] "
+	    "[-i interval] [-l length]\n"
+	    "             [-m mode] [-p port] [-q seq] [-S sport] [-s ssid] "
+	    "[-t ttl]\n"
+	    "             [-W wait] host\n");
 	exit(1);
 }
 
@@ -68,6 +72,24 @@ ok(bool b)
 {
 
 	return (b ? "ok" : "bad");
+}
+
+/* The reflector's Timestamp Information, "-" with none. */
+static const char *
+tsinfo(const struct stamp_sample *sm)
+{
+	static char	buf[64];
+
+	if (!sm->has_tsinfo)
+		return ("-");
+	(void)snprintf(buf, sizeof(buf), "%s/", stamp_sync_name(
+	    sm->tsinfo.sync_in));
+	(void)strlcat(buf, stamp_tsm_name(sm->tsinfo.ts_in), sizeof(buf));
+	(void)strlcat(buf, ",", sizeof(buf));
+	(void)strlcat(buf, stamp_sync_name(sm->tsinfo.sync_out), sizeof(buf));
+	(void)strlcat(buf, "/", sizeof(buf));
+	(void)strlcat(buf, stamp_tsm_name(sm->tsinfo.ts_out), sizeof(buf));
+	return (buf);
 }
 
 static uint32_t
@@ -93,15 +115,24 @@ main(int argc, char *argv[])
 	char			  from[64];
 	double			  interval = 1, wait = 2, start, at, until, now;
 	double			  sum = 0, min = 0, max = 0, left, ex;
+	double			  fsum = 0, bsum = 0;
 	ssize_t			  n;
-	size_t			  len = STAMP_UNAUTH_LEN, i;
-	unsigned long		  count = 1, k = 0;
+	size_t			  len = STAMP_UNAUTH_LEN, plen, pad, i;
+	unsigned long		  count = 1, k = 0, measured = 0;
 	int			  ch, fd, kq, ttl = -1, port = STAMP_PORT;
 	int			  sport = 0, rc;
 
 	memset(&sc, 0, sizeof(sc));
-	while ((ch = getopt(argc, argv, "c:i:l:m:p:q:S:s:t:W:")) != -1)
+	while ((ch = getopt(argc, argv, "C:c:i:l:m:p:q:S:s:Tt:W:")) != -1)
 		switch (ch) {
+		case 'C':
+			if (stamp_clock_set(optarg) == -1)
+				errx(1, "-C %s: ntp, ptp, ssu, gnss or local, "
+				    "and :error in seconds", optarg);
+			break;
+		case 'T':
+			sc.tsinfo = true;
+			break;
 		case 'c':
 			count = (unsigned long)num("c", optarg, 1, 1000000);
 			break;
@@ -163,9 +194,21 @@ main(int argc, char *argv[])
 	sc.window = WINDOW;
 	if ((snd = stamp_sender_new(&sc)) == NULL)
 		err(1, "the sender");
-	/* What follows the base: a pattern, to see it come back. */
+	/*
+	 * What follows the base: a pattern, to see it come back; with -T
+	 * the TLV first, the pattern in an Extra Padding TLV after it,
+	 * the packet as long as they need.  Without, the base whatever
+	 * the length (a short one to see it refused).
+	 */
 	for (i = STAMP_UNAUTH_LEN; i < sizeof(pkt); i++)
 		pkt[i] = (uint8_t)i;
+	pad = STAMP_UNAUTH_LEN;
+	if (sc.tsinfo) {
+		len = stamp_sender_len(snd, len);
+		plen = len;
+		pad += STAMP_TSINFO_LEN;
+	} else
+		plen = sizeof(pkt);
 
 	stamp_sender_stats(snd, &st);
 	start = stamp_mono();
@@ -174,7 +217,7 @@ main(int argc, char *argv[])
 		/* The next packet, when its time has come. */
 		if (k < count && now >= start + (double)k * interval) {
 			clock_gettime(CLOCK_REALTIME, &t1);
-			if ((rc = stamp_sender_packet(snd, pkt, sizeof(pkt), &t1,
+			if ((rc = stamp_sender_packet(snd, pkt, plen, &t1,
 			    now, &sm)) == -1)
 				err(1, "a packet");
 			if (rc == 1)
@@ -211,11 +254,13 @@ main(int argc, char *argv[])
 			at = (double)ri.mono.tv_sec + (double)ri.mono.tv_nsec /
 			    1e9;
 			/* Another's, late, again: passed over. */
-			if (stamp_sender_reply(snd, in, (size_t)n, at, &sm) != 1)
+			if (stamp_sender_reply(snd, in, (size_t)n, at, &ri.t,
+			    &sm) != 1)
 				continue;
 			printf("len=%zd from=%s seq=%u ssid=%u sseq=%u ttl=%u "
 			    "rttl=%d echo=%s order=%s clock=%s serr=%s mbz=%s "
-			    "pad=%s rtt=%.3f fwd=%.3f back=%.3f\n", n,
+			    "pad=%s rtt=%.3f fwd=%.3f back=%.3f owd=%s err=%.6f "
+			    "ti=%s\n", n,
 			    stamp_sa_ntop((struct sockaddr *)&ri.peer, from,
 			    sizeof(from)), sm.r.seq, sm.r.ssid, sm.r.sseq,
 			    sm.r.sttl, ri.ttl, ok(memcmp(in + 28,
@@ -224,11 +269,14 @@ main(int argc, char *argv[])
 			    ok(fabs(stamp_ts_sub(&sm.r.rx, &ri.t)) < 5 &&
 			    fabs(stamp_ts_sub(&sm.r.ts, &ri.t)) < 5),
 			    ok((sm.r.ee & 0xff) != 0), ok(sm.r.mbz_ok),
-			    ok((size_t)n == len && memcmp(in + STAMP_UNAUTH_LEN,
-			    pkt + STAMP_UNAUTH_LEN, (size_t)n -
-			    STAMP_UNAUTH_LEN) == 0), sm.rtt * 1e3,
-			    stamp_ts_sub(&sm.r.rx, &sm.r.sts) * 1e3,
-			    stamp_ts_sub(&ri.t, &sm.r.ts) * 1e3);
+			    ok((size_t)n == len && memcmp(in + pad, pkt + pad,
+			    (size_t)n - pad) == 0), sm.rtt * 1e3, sm.fwd * 1e3,
+			    sm.back * 1e3, sm.owd ? "measured" : "estimated",
+			    sm.err * 1e3, tsinfo(&sm));
+			fsum += sm.fwd;
+			bsum += sm.back;
+			if (sm.owd)
+				measured++;
 			if (st.received == 0 || sm.rtt < min)
 				min = sm.rtt;
 			if (st.received == 0 || sm.rtt > max)
@@ -249,8 +297,10 @@ main(int argc, char *argv[])
 			printf(" forward=- backward=-");
 		printf(" reflector=%s", stamp_mode_name(st.mode));
 		if (st.received > 0)
-			printf(" rtt=%.3f/%.3f/%.3f", min * 1e3, sum /
-			    (double)st.received * 1e3, max * 1e3);
+			printf(" rtt=%.3f/%.3f/%.3f fwd=%.3f back=%.3f "
+			    "measured=%lu", min * 1e3, sum / (double)st.received *
+			    1e3, max * 1e3, fsum / (double)st.received * 1e3,
+			    bsum / (double)st.received * 1e3, measured);
 		printf("\n");
 	}
 	stamp_sender_free(snd);

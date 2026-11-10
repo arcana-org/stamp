@@ -12,6 +12,8 @@
 .Nm stamp_test_decode ,
 .Nm stamp_reflected_decode ,
 .Nm stamp_tlv_next ,
+.Nm stamp_tlv_put ,
+.Nm stamp_tsinfo_find ,
 .Nm stamp_ntp_put ,
 .Nm stamp_ntp_get ,
 .Nm stamp_ptp_put ,
@@ -22,6 +24,10 @@
 .Nm stamp_ee_make ,
 .Nm stamp_ee_seconds ,
 .Nm stamp_ee_clock ,
+.Nm stamp_clock_get ,
+.Nm stamp_clock_set ,
+.Nm stamp_sync_name ,
+.Nm stamp_tsm_name ,
 .Nm stamp_refl_new ,
 .Nm stamp_refl_setconf ,
 .Nm stamp_refl_free ,
@@ -34,6 +40,7 @@
 .Nm stamp_sender_free ,
 .Nm stamp_sender_packet ,
 .Nm stamp_sender_reply ,
+.Nm stamp_sender_len ,
 .Nm stamp_sender_expire ,
 .Nm stamp_sender_next ,
 .Nm stamp_sender_stats ,
@@ -59,6 +66,10 @@ STAMP Library
 .Fn stamp_reflected_decode "const uint8_t *buf" "size_t len" "struct stamp_reflected *r"
 .Ft int
 .Fn stamp_tlv_next "const uint8_t *pkt" "size_t len" "size_t *off" "struct stamp_tlv *tlv"
+.Ft int
+.Fn stamp_tlv_put "uint8_t *pkt" "size_t len" "size_t *off" "uint8_t type" "const void *value" "uint16_t vlen"
+.Ft int
+.Fn stamp_tsinfo_find "const uint8_t *pkt" "size_t len" "struct stamp_tsinfo *ti"
 .Ft void
 .Fn stamp_ntp_put "uint8_t *p" "const struct timespec *ts"
 .Ft void
@@ -79,6 +90,14 @@ STAMP Library
 .Fn stamp_ee_seconds "uint16_t ee"
 .Ft uint16_t
 .Fn stamp_ee_clock "void"
+.Ft void
+.Fn stamp_clock_get "struct stamp_clock *c"
+.Ft int
+.Fn stamp_clock_set "const char *spec"
+.Ft "const char *"
+.Fn stamp_sync_name "uint8_t v"
+.Ft "const char *"
+.Fn stamp_tsm_name "uint8_t v"
 .Ft "struct stamp_refl *"
 .Fn stamp_refl_new "const struct stamp_refl_conf *c"
 .Ft int
@@ -102,7 +121,9 @@ STAMP Library
 .Ft int
 .Fn stamp_sender_packet "struct stamp_sender *s" "uint8_t *buf" "size_t len" "const struct timespec *t1" "double mono" "struct stamp_sample *lostp"
 .Ft int
-.Fn stamp_sender_reply "struct stamp_sender *s" "const uint8_t *pkt" "size_t len" "double mono" "struct stamp_sample *out"
+.Fn stamp_sender_reply "struct stamp_sender *s" "const uint8_t *pkt" "size_t len" "double mono" "const struct timespec *t4" "struct stamp_sample *out"
+.Ft size_t
+.Fn stamp_sender_len "const struct stamp_sender *s" "size_t want"
 .Ft int
 .Fn stamp_sender_expire "struct stamp_sender *s" "double mono" "struct stamp_sample *out"
 .Ft double
@@ -129,17 +150,17 @@ STAMP Library
 The
 .Nm
 library implements the Simple Two-way Active Measurement Protocol
-(STAMP, RFC 8762) with the Session-Sender Identifier of RFC 8972:
+(STAMP, RFC 8762) with the Session-Sender Identifier and the
+Timestamp Information TLV of RFC 8972:
 its packets in unauthenticated mode, its timestamps and error
-estimate, the Session-Reflector's core, the Session-Sender's core and
-the UDP socket of either end.
+estimate, the clock's synchronisation, the Session-Reflector's core,
+the Session-Sender's core and the UDP socket of either end.
 It has no other dependency than the C library.
 The authenticated mode
 .Pq Dv STAMP_AUTH , No 112 octets and an HMAC
-is not implemented yet; the TLVs that follow the base packet are
-read by
-.Fn stamp_tlv_next
-and otherwise carried as they are.
+is not implemented yet; of the TLVs that follow the base packet, the
+Timestamp Information TLV is filled by the reflector and read by the
+sender, the others carried as they are.
 .Ss Packets
 .Fn stamp_test_encode
 writes a Session-Sender test packet
@@ -168,6 +189,35 @@ past it: 1, 0 when none is left, or \-1 with
 .Va errno
 .Er EBADMSG
 when one runs past the packet.
+.Fn stamp_tlv_put
+writes a TLV of
+.Fa type
+and
+.Fa vlen
+octets of
+.Fa value
+(NULL: what is there left as it is) at
+.Fa *off ,
+its flags 0, and moves
+.Fa *off
+past it; \-1 with
+.Er EMSGSIZE
+when it does not fit.
+.Fn stamp_tsinfo_find
+reads a reflected packet's Timestamp Information TLV
+.Pq Dv STAMP_TLV_TSINFO , No RFC 8972 section 4.3
+into
+.Vt struct stamp_tsinfo :
+the reflector's clock's synchronisation source
+.Pq Dv STAMP_SYNC_NTP , STAMP_SYNC_PTP , STAMP_SYNC_SSU , STAMP_SYNC_GNSS , STAMP_SYNC_LOCAL
+and how it took T2
+.Pq Va sync_in , ts_in
+and T3
+.Pq Va sync_out , ts_out ;
+the methods
+.Dv STAMP_TSM_HW , STAMP_TSM_SW , STAMP_TSM_CP .
+It returns 1, 0 when there is none or the reflector marked it
+unrecognised, \-1 when the TLVs run past the packet.
 .Ss Timestamps and the error estimate
 .Fn stamp_ntp_put
 and
@@ -208,11 +258,43 @@ rounded up and never 0.
 .Fn stamp_ee_seconds
 is the error an estimate says.
 .Fn stamp_ee_clock
-is the clock's, from
+is the clock's,
+.Fn stamp_clock_get Ns 's .
+.Pp
+.Fn stamp_clock_get
+says the clock
+.Pq Vt struct stamp_clock :
+its error estimate and its synchronisation source, from
 .Xr ntp_gettime 2 :
 synchronised unless its state is
 .Dv TIME_ERROR ,
-the error its maximum error.
+then by
+.Dv STAMP_SYNC_NTP ,
+else
+.Dv STAMP_SYNC_LOCAL
+(free-running); the error its maximum error.
+.Fn stamp_clock_set
+says it instead, for the process, for a clock that
+.Xr ntp_gettime 2
+does not know is synchronised:
+.Fa spec
+is
+.Ql source Ns Op : Ns Ar error ,
+the source
+.Cm ntp , ptp , ssu , gnss
+or
+.Cm local
+(not synchronised), the error in seconds (default the least an error
+estimate says); NULL goes back to
+.Xr ntp_gettime 2 .
+It returns 0, or \-1 with
+.Er EINVAL .
+.Fn stamp_sync_name
+and
+.Fn stamp_tsm_name
+name a source and a method,
+.Ql -
+for 0.
 .Ss The Session-Reflector
 .Fn stamp_refl_new
 makes a reflector of
@@ -239,6 +321,9 @@ and the seconds one ends after without a packet
 .It Va port
 The reflector's own port: a packet from it is not answered, nor one
 from port 0.
+.It Va ts_out
+How the caller takes T3, for the Timestamp Information TLV; 0 for
+.Dv STAMP_TSM_SW .
 .El
 .Pp
 .Fn stamp_refl_setconf
@@ -250,6 +335,18 @@ the session's tag and a monotonic time (0: now) into
 .Fa out
 and returns the reply's length, always the packet's: what follows the
 base is copied.
+When that is TLVs to its end, none of type 0, the Timestamp
+Information TLV is filled (the clock's source,
+.Va ts_in
+of the
+.Vt struct stamp_rx
+for T2, 0 for
+.Dv STAMP_TSM_SW ,
+and
+.Va ts_out
+for T3) and any other but Extra Padding marked unrecognised
+.Pq Dv STAMP_TLV_U ;
+anything else is padding, copied as it is.
 A packet shorter than the base, from port 0 or the reflector's own, or
 over a rate limit is not answered: \-1, why in
 .Fa *why
@@ -285,6 +382,13 @@ for the first reply to tell.
 Seconds a reply is waited for (0: 2); one later is lost.
 .It Va window
 Packets in flight at most (0: 256).
+.It Va tsinfo
+The packets carry the Timestamp Information TLV for the reflector to
+fill.
+.It Va owd_frac
+The delay each way is said one way when the two error estimates
+together are no more than this part of half the round trip
+.Pq 0: Dv STAMP_OWD_FRAC , No a tenth .
 .El
 .Pp
 Like the reflector's, the core does no I/O: the caller sends and
@@ -300,10 +404,27 @@ its timestamp
 it returns 0, or 1 when the window was full and its oldest packet
 given up, lost, that one's sample in
 .Fa *lostp .
+With
+.Va tsinfo ,
+the Timestamp Information TLV follows the base, empty, and an Extra
+Padding TLV the rest,
+.Fa len
+as
+.Fn stamp_sender_len
+says: the base's 44 octets at least, 52 with the TLV, and with more
+after it 4 octets or more
+.Pq else Er EMSGSIZE ;
+.Fn stamp_sender_len
+is that length for one of
+.Fa want
+octets.
 .Fn stamp_sender_reply
 matches a reply that came at
-.Fa mono
-to its packet by the SSID and the sender's sequence number it echoes:
+.Fa mono ,
+and at
+.Fa t4
+on the time of day (NULL: not known), to its packet by the SSID and
+the sender's sequence number it echoes:
 1 with its sample in
 .Fa *out ,
 0 for none of the session's packets in flight (another SSID, a reply
@@ -315,7 +436,24 @@ has the round trip with the reflector's time taken out,
 = (T4 \- T1) \- (T3 \- T2), T1 and T4 monotonic and T2 and T3 both the
 reflector's, so that neither clock need be right;
 .Va refl
-is T3 \- T2, and
+is T3 \- T2;
+.Va fwd
+and
+.Va back
+the delay each way, T2 \- T1 and T4 \- T3 with T1 and T4 on the time of
+day when
+.Va owd :
+both ends' error estimates say synchronised (S), their errors
+together
+.Pq Va err
+no more than
+.Va owd_frac
+of half the round trip, and neither way negative; otherwise half the
+round trip each, an estimate;
+.Va has_tsinfo
+and
+.Va tsinfo
+the reflector's Timestamp Information TLV; and
 .Va r
 the reply.
 .Fn stamp_sender_expire
@@ -381,8 +519,11 @@ reads a packet and what came with it
 .Va t
 the time of day it came,
 .Va mono
-the monotonic time, each the kernel's when it said, else the
-clock's.
+the monotonic time, each the kernel's when it said, the other then
+that instant on its clock, else the clock's;
+.Va hwts
+when the kernel says the hardware took it
+.Pq Dv SCM_TIME_INFO .
 .Fn stamp_send
 sends from the address
 .Fa from

@@ -7,7 +7,10 @@
 /*
  * The test packets of the unauthenticated mode, both ways (RFC 8762
  * 4.2.1 and 4.3.1), the octets 14 and 15 the Session-Sender Identifier
- * (RFC 8972 3), and the TLVs that may follow (RFC 8972 4).  The
+ * (RFC 8972 3), and the TLVs that may follow (RFC 8972 4): a flags
+ * octet (U, M, I), the type, a 16-bit length and the value; the
+ * Timestamp Information TLV (4.3, type 3) four octets, the sync source
+ * and timestamping method of T2, then of T3.  The
  * authenticated mode's (4.2.2, 4.3.2) would be STAMP_AUTH_LEN octets
  * and an HMAC: not yet.
  *
@@ -141,4 +144,55 @@ stamp_tlv_next(const uint8_t *pkt, size_t len, size_t *off,
 	tlv->value = pkt + at + 4;
 	*off = at + 4 + tlv->len;
 	return (1);
+}
+
+/*
+ * A TLV of type and vlen octets of value (NULL: what is there left as
+ * it is) at *off (STAMP_UNAUTH_LEN first) of a packet of len octets,
+ * its flags 0, *off moved past it: 0, or -1 with errno EMSGSIZE when
+ * it does not fit.
+ */
+int
+stamp_tlv_put(uint8_t *pkt, size_t len, size_t *off, uint8_t type,
+    const void *value, uint16_t vlen)
+{
+	size_t	at = *off < STAMP_UNAUTH_LEN ? STAMP_UNAUTH_LEN : *off;
+
+	if (at > len || len - at < (size_t)STAMP_TLV_HDR + vlen) {
+		errno = EMSGSIZE;
+		return (-1);
+	}
+	pkt[at] = 0;
+	pkt[at + 1] = type;
+	put16(pkt + at + 2, vlen);
+	if (value != NULL)
+		memcpy(pkt + at + 4, value, vlen);
+	*off = at + 4 + vlen;
+	return (0);
+}
+
+/*
+ * The Timestamp Information TLV of a reflected packet into ti: 1 when
+ * the reflector filled it (no U flag: it knew it), 0 when there is
+ * none or it did not, -1 when the TLVs go past the packet (EBADMSG).
+ */
+int
+stamp_tsinfo_find(const uint8_t *pkt, size_t len, struct stamp_tsinfo *ti)
+{
+	struct stamp_tlv	v;
+	size_t			off = STAMP_UNAUTH_LEN;
+	int			rc;
+
+	while ((rc = stamp_tlv_next(pkt, len, &off, &v)) == 1) {
+		if (v.type != STAMP_TLV_TSINFO || v.len < 4)
+			continue;
+		if (v.flags & (STAMP_TLV_U | STAMP_TLV_M))
+			return (0);
+		ti->sync_in = v.value[0];
+		ti->ts_in = v.value[1];
+		ti->sync_out = v.value[2];
+		ti->ts_out = v.value[3];
+		return (1);
+	}
+	return (rc);
 }

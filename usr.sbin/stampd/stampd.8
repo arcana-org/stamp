@@ -12,6 +12,7 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl d
+.Op Fl C Ar source Ns Op : Ns Ar error
 .Op Fl f Ar file
 .Op Fl m Cm stateless | stateful
 .Op Fl P Ar pidfile
@@ -47,6 +48,25 @@ leaves from the address the packet came to, with TTL 255.
 It is no amplifier: a packet shorter than 44 octets, RFC 8762's base,
 is not answered, and a reply is exactly as long as its packet, what
 follows the base (padding, TLVs) copied.
+A sender's Timestamp Information TLV (RFC 8972 section 4.3) is filled
+in: the clock's synchronisation source
+.Pf ( Cm ntp
+when
+.Xr ntp_gettime 2
+says the clock is synchronised,
+.Cm local
+.Pq free-running
+when not, or as
+.Fl C
+says) and how the times were taken
+.Pf ( Cm hw
+when the kernel says the hardware took the time a packet came in, else
+.Cm sw ;
+.Cm sw
+the time its reply leaves); another TLV but Extra Padding is marked
+unrecognised (its U flag).
+What follows the base is taken as TLVs only when it is TLVs to its end,
+none of type 0; anything else, padding, is copied as it is.
 Nor is a packet from port 0 or from
 .Ar port
 answered, nor one over the rate limits; those are dropped silently,
@@ -63,6 +83,22 @@ and runs as
 .Pp
 The options are as follows:
 .Bl -tag -width "-r rate[/burst]"
+.It Fl C Ar source Ns Op : Ns Ar error
+The clock as it is, for one that
+.Xr ntp_gettime 2
+does not know is synchronised: by PTP without the kernel's PLL, by a
+GNSS receiver, or on the same host as the sender's, whose clock it is.
+.Ar source
+is
+.Cm ntp , ptp , ssu , gnss
+or
+.Cm local
+(free-running: not synchronised), and
+.Ar error
+the clock's error in seconds (default the least the Error Estimate
+says).
+The replies' Error Estimate then says synchronised with that error, as
+the Timestamp Information TLV says that source.
 .It Fl d
 Stay in the foreground and log to the standard error too, debugging
 messages among them.

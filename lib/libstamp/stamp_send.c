@@ -16,6 +16,15 @@
  * time of day changes nothing), T2 and T3 both the reflector's, so
  * that neither clock need be right.
  *
+ * The delay each way does need them right: (T2 - T1) forward and
+ * (T4 - T3) back, T1 and T4 on the time of day, said only when both
+ * ends' Error Estimates say their clocks are synchronised (S) and the
+ * two errors together are no more than owd_frac (a tenth) of half the
+ * round trip, so that what is said is right to a tenth; otherwise half
+ * the round trip each way, flagged an estimate.  With tsinfo the
+ * packets carry the Timestamp Information TLV (RFC 8972 4.3), which
+ * the reflector fills: its clock's source, how it took T2 and T3.
+ *
  * A packet not back within the timeout is lost.  Which way it was lost
  * a stateful reflector tells (4.3.2): its Sequence Number counts the
  * packets of the session it reflected, so between two replies the
@@ -53,6 +62,8 @@ enum { E_FREE = 0, E_PENDING, E_REPLIED, E_LOST };
 struct ent {
 	uint8_t		 st;
 	double		 mono;		/* sent */
+	struct timespec	 t1;		/* the same, the time of day */
+	uint16_t	 ee;		/* the Error Estimate it carried */
 	uint32_t	 rseq;		/* the reflector's, replied */
 };
 
@@ -93,6 +104,8 @@ stamp_sender_new(const struct stamp_sender_conf *c)
 		s->c.window = SND_WINDOW;
 	if (s->c.window > SND_WINDOW_MAX)
 		s->c.window = SND_WINDOW_MAX;
+	if (s->c.owd_frac <= 0)
+		s->c.owd_frac = STAMP_OWD_FRAC;
 	for (cap = 1; cap < s->c.window; cap <<= 1)
 		;
 	if ((s->ring = calloc(cap, sizeof(*s->ring))) == NULL) {
@@ -176,21 +189,44 @@ lose(struct stamp_sender *s, uint32_t seq, struct stamp_sample *out)
 }
 
 /*
+ * The length of a packet of the sender's for one of want octets: the
+ * base's at least, and with the Timestamp Information TLV, its too,
+ * what is left after it 0 or an Extra Padding TLV's 4 octets or more.
+ */
+size_t
+stamp_sender_len(const struct stamp_sender *s, size_t want)
+{
+	size_t	min = STAMP_UNAUTH_LEN;
+
+	if (s->c.tsinfo)
+		min += STAMP_TSINFO_LEN;
+	if (want < min)
+		return (min);
+	if (s->c.tsinfo && want - min > 0 && want - min < STAMP_TLV_HDR)
+		return (min + STAMP_TLV_HDR);
+	return (want);
+}
+
+/*
  * The next test packet into buf (len octets, STAMP_UNAUTH_LEN or more;
- * what follows the base left as it is), sent at t1 (the time of day,
- * in the packet) and mono (monotonic seconds).  0; 1 when the window
- * was full and its oldest packet given up, lost, its sample in *lostp;
- * -1 with errno.
+ * what follows the base left as it is, or with tsinfo the Timestamp
+ * Information TLV, empty, and an Extra Padding TLV over the rest, its
+ * octets left as they are: len as stamp_sender_len() says), sent at t1
+ * (the time of day, in the packet) and mono (monotonic seconds).  0; 1
+ * when the window was full and its oldest packet given up, lost, its
+ * sample in *lostp; -1 with errno.
  */
 int
 stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
     const struct timespec *t1, double mono, struct stamp_sample *lostp)
 {
+	static const uint8_t	 empty[4];
 	struct stamp_test	 t;
 	struct ent		*e;
+	size_t			 off;
 	int			 rc = 0;
 
-	if (len < STAMP_UNAUTH_LEN) {
+	if (len < STAMP_UNAUTH_LEN || stamp_sender_len(s, len) != len) {
 		errno = EMSGSIZE;
 		return (-1);
 	}
@@ -210,9 +246,20 @@ stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
 	t.ssid = s->c.ssid;
 	if (stamp_test_encode(buf, len, &t) == -1)
 		return (-1);
+	if (s->c.tsinfo) {
+		off = STAMP_UNAUTH_LEN;
+		if (stamp_tlv_put(buf, len, &off, STAMP_TLV_TSINFO, empty,
+		    sizeof(empty)) == -1)
+			return (-1);
+		if (len > off && stamp_tlv_put(buf, len, &off, STAMP_TLV_PAD,
+		    NULL, (uint16_t)(len - off - STAMP_TLV_HDR)) == -1)
+			return (-1);
+	}
 	e = &s->ring[s->next & s->mask];
 	e->st = E_PENDING;
 	e->mono = mono;
+	e->t1 = *t1;
+	e->ee = s->ee;
 	e->rseq = 0;
 	s->next++;
 	s->st.sent++;
@@ -220,13 +267,43 @@ stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
 }
 
 /*
- * A reply (len octets) that came at mono: 1 and its sample in *out
- * when it answers a packet in flight; 0 when it is none (another
- * session's, late, again); -1 when it is no reflected packet (errno).
+ * The delay each way of a reply's sample: one way when both ends'
+ * Error Estimates say synchronised and their errors together are
+ * within owd_frac of half the round trip, neither way negative; else
+ * half the round trip each, an estimate.  t4 NULL: not known.
+ */
+static void
+one_way(const struct stamp_sender *s, const struct ent *e,
+    const struct stamp_reflected *r, const struct timespec *t4,
+    struct stamp_sample *out)
+{
+	double	fwd, back;
+
+	out->err = stamp_ee_seconds(e->ee) + stamp_ee_seconds(r->ee);
+	out->owd = false;
+	if (t4 != NULL && (e->ee & STAMP_EE_S) && (r->ee & STAMP_EE_S) &&
+	    out->err <= s->c.owd_frac * out->rtt / 2) {
+		fwd = stamp_ts_sub(&r->rx, &e->t1);
+		back = stamp_ts_sub(t4, &r->ts);
+		if (fwd >= 0 && back >= 0) {
+			out->fwd = fwd;
+			out->back = back;
+			out->owd = true;
+			return;
+		}
+	}
+	out->fwd = out->back = out->rtt / 2;
+}
+
+/*
+ * A reply (len octets) that came at mono, and t4 (the time of day; NULL
+ * not known): 1 and its sample in *out when it answers a packet in
+ * flight; 0 when it is none (another session's, late, again); -1 when
+ * it is no reflected packet (errno).
  */
 int
 stamp_sender_reply(struct stamp_sender *s, const uint8_t *pkt, size_t len,
-    double mono, struct stamp_sample *out)
+    double mono, const struct timespec *t4, struct stamp_sample *out)
 {
 	struct stamp_reflected	 r;
 	struct ent		*e;
@@ -274,6 +351,9 @@ stamp_sender_reply(struct stamp_sender *s, const uint8_t *pkt, size_t len,
 		out->rtt = raw - refl;
 		out->refl = refl;
 		out->r = r;
+		one_way(s, e, &r, t4, out);
+		out->has_tsinfo = stamp_tsinfo_find(pkt, len, &out->tsinfo) ==
+		    1;
 	}
 	advance(s);
 	return (1);

@@ -11,6 +11,8 @@
 .Nd send STAMP test packets
 .Sh SYNOPSIS
 .Nm
+.Op Fl T
+.Op Fl C Ar source Ns Op : Ns Ar error
 .Op Fl c Ar count
 .Op Fl i Ar interval
 .Op Fl l Ar length
@@ -45,6 +47,18 @@ It sends in the FIB it runs in
 .Pp
 The options are as follows:
 .Bl -tag -width "-i interval"
+.It Fl T
+Ask for the reflector's Timestamp Information TLV (RFC 8972 section
+4.3): the packet carries it after the base, and what
+.Fl l
+adds beyond it is an Extra Padding TLV (the packet 52 octets at least,
+and 56 or more when longer).
+.It Fl C Ar source Ns Op : Ns Ar error
+This host's clock as it is, for one that
+.Xr ntp_gettime 2
+does not know is synchronised, as
+.Xr stampd 8 Ns 's
+.Fl C .
 .It Fl c Ar count
 Packets to send; default 1.
 .It Fl i Ar interval
@@ -101,8 +115,29 @@ Its MBZ octets are zero.
 It is as long as the packet, what followed the base come back.
 .It Cm rtt , fwd , back
 Milliseconds: the round trip less the reflector's time, (T4 \- T1) \-
-(T3 \- T2), T1 and T4 on the monotonic clock; and, by the two clocks,
-the way out (T2 \- T1) and back (T4 \- T3).
+(T3 \- T2), T1 and T4 on the monotonic clock; and the delay each way.
+.It Cm owd
+.Cm measured
+when the delay each way is by the two clocks, the way out (T2 \- T1)
+and back (T4 \- T3), T1 and T4 on the time of day: both error
+estimates say synchronised, and the two errors together are no more
+than a tenth of half the round trip, neither way negative;
+.Cm estimated
+when not, each way half the round trip.
+.It Cm err
+Milliseconds: the two error estimates together.
+.It Cm ti
+The reflector's Timestamp Information, with
+.Fl T :
+its clock's source and how it took the time the packet came, then the
+same of the time it replied, as
+.Ql ntp/sw,ntp/sw
+(sources
+.Cm ntp , ptp , ssu , gnss , local ;
+methods
+.Cm hw , sw , cp ) ;
+.Ql -
+without.
 .El
 .Pp
 With a count above 1, a last line says the packets
@@ -122,9 +157,15 @@ started again); from a stateless one
 .Ql forward=- backward=- ,
 the round trip's alone;
 .Cm reflector ,
-its mode; and
+its mode;
 .Cm rtt ,
-the round trips' least, mean and most.
+the round trips' least, mean and most;
+.Cm fwd
+and
+.Cm back ,
+the delay each way, the mean; and
+.Cm measured ,
+how many replies' delay each way was by the two clocks.
 .Sh EXIT STATUS
 .Nm
 exits 0 when a reply came, 2 when none did, and 1 on an error.
@@ -132,6 +173,7 @@ exits 0 when a reply came, 2 when none did, and 1 on an error.
 .Bd -literal -offset indent
 $ stamp -c 100 -i 0.1 192.0.2.1
 $ setfib 1 stamp -s 7 -l 200 2001:db8::1
+$ stamp -T -C ptp:0.000001 -c 10 192.0.2.1
 .Ed
 .Sh SEE ALSO
 .Xr setfib 1 ,

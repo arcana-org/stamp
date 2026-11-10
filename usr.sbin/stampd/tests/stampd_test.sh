@@ -444,6 +444,67 @@ loss_cleanup()
 	stop
 }
 
+atf_test_case owd cleanup
+owd_head()
+{
+	atf_set "descr" "The delay each way through a relay that holds the" \
+	    "packets 30 ms on the way out and the replies none: one way" \
+	    "when both clocks say synchronised within a microsecond (one" \
+	    "host's clock both ends' by construction: -C says so), 30 ms" \
+	    "out and next to none back, the Timestamp Information TLV" \
+	    "filled; half the round trip each, flagged, when the reflector's" \
+	    "error is a second; no TLV unless asked for"
+	atf_set "timeout" "60"
+}
+owd_body()
+{
+	local L
+
+	L=$(atf_get_srcdir)/udplossy
+	P=$(port)
+	R=$(port)
+	"$L" $R $P 0 0 30 > relay.out 2>&1 &
+	echo $! > relay.pid
+	wait_match '^ready$' cat relay.out || atf_fail "no relay"
+	start -p $P -r 0 -C ptp:0.000001
+	atf_check -o save:sync.out "$S" -T -C ptp:0.000001 -p $R -c 5 \
+	    -i 0.05 127.0.0.1
+	stop
+	cat sync.out
+	atf_check -o inline:'5\n' grep -c \
+	    '^len=52 .* pad=ok .* owd=measured err=0\.00[0-9]* ti=ptp/sw,ptp/sw$' \
+	    sync.out
+	atf_check -o inline:'5\n' awk '/^len=/ { split($0, f, /[ =]/);
+	    for (i = 1; i < length(f); i++) v[f[i]] = f[i + 1];
+	    if (v["fwd"] >= 28 && v["fwd"] < 45 && v["back"] < 5) n++ }
+	    END { print n + 0 }' sync.out
+	atf_check -o match:' fwd=[23][0-9]\.[0-9]+ back=[0-4]\.[0-9]+ measured=5$' \
+	    tail -1 sync.out
+	# A second's error on the reflector's side: half the round trip.
+	start -p $P -r 0 -C ntp:1
+	atf_check -o save:est.out "$S" -T -C ptp:0.000001 -l 100 -p $R \
+	    -c 3 -i 0.05 127.0.0.1
+	stop
+	cat est.out
+	atf_check -o inline:'3\n' grep -c \
+	    '^len=100 .* pad=ok .* owd=estimated err=10[0-9][0-9]\.[0-9]* ti=ntp/sw,ntp/sw$' \
+	    est.out
+	atf_check -o inline:'3\n' awk '/^len=/ { split($0, f, /[ =]/);
+	    for (i = 1; i < length(f); i++) v[f[i]] = f[i + 1];
+	    if (v["fwd"] == v["back"] && v["fwd"] >= 14 && v["fwd"] < 25) n++ }
+	    END { print n + 0 }' est.out
+	atf_check -o match:' measured=0$' tail -1 est.out
+	# Not asked for: none, and the base packet as before.
+	start -p $P -r 0 -C ptp:0.000001
+	atf_check -o match:'^len=44 .* owd=measured .* ti=-$' \
+	    "$S" -C ptp:0.000001 -p $R 127.0.0.1
+}
+owd_cleanup()
+{
+	[ -f relay.pid ] && kill "$(cat relay.pid)" 2>/dev/null
+	stop
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case stateless
@@ -454,4 +515,5 @@ atf_init_test_cases()
 	atf_add_test_case rc_script
 	atf_add_test_case privileges
 	atf_add_test_case loss
+	atf_add_test_case owd
 }

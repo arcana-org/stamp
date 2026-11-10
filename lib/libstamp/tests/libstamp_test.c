@@ -498,8 +498,8 @@ ATF_TC_BODY(sender_rtt, tc)
 	/* 50 ms there and back, 10 of them the reflector's own. */
 	ATF_REQUIRE(sendrefl(s, r, 100, 0.010, false, out, NULL) > 0);
 	ATF_CHECK_EQ(stamp_sender_next(s), 101);
-	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 100.050, &sm) ==
-	    1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 100.050,
+	    NULL, &sm) == 1);
 	ATF_CHECK(!sm.lost);
 	ATF_CHECK_MSG(sm.rtt > 0.0399 && sm.rtt < 0.0401, "rtt %g", sm.rtt);
 	ATF_CHECK_MSG(sm.refl > 0.0099 && sm.refl < 0.0101, "refl %g",
@@ -508,16 +508,16 @@ ATF_TC_BODY(sender_rtt, tc)
 	ATF_CHECK_EQ(sm.r.sttl, 64);
 	ATF_CHECK_EQ(stamp_sender_next(s), 0);
 	/* The same reply again; another session's; garbage. */
-	ATF_CHECK(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 100.06, &sm) ==
-	    0);
+	ATF_CHECK(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 100.06,
+	    NULL, &sm) == 0);
 	out[15] = 8;
-	ATF_CHECK(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 100.06, &sm) ==
-	    0);
-	ATF_CHECK(stamp_sender_reply(s, out, 43, 100.06, &sm) == -1);
+	ATF_CHECK(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 100.06,
+	    NULL, &sm) == 0);
+	ATF_CHECK(stamp_sender_reply(s, out, 43, 100.06, NULL, &sm) == -1);
 	/* The reflector's clock says more than the round trip: 0. */
 	ATF_REQUIRE(sendrefl(s, r, 101, 0.5, false, out, NULL) > 0);
-	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 101.1, &sm) ==
-	    1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 101.1,
+	    NULL, &sm) == 1);
 	ATF_CHECK_EQ(sm.rtt, 0);
 	stamp_sender_stats(s, &st);
 	ATF_CHECK_EQ(st.sent, 2);
@@ -563,13 +563,14 @@ loss_run(bool stateful, struct stamp_sender_stats *st)
 		    out, NULL) == 0 || back_lost[i])
 			continue;
 		ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, t +
-		    0.02, &sm) == 1);
+		    0.02, NULL, &sm) == 1);
 	}
 	while (stamp_sender_expire(s, 100, &sm) == 1)
 		lost++;
 	ATF_CHECK_EQ(lost, 6);
 	/* 12's reply, after its timeout: late, still lost. */
-	ATF_CHECK(stamp_sender_reply(s, late, STAMP_UNAUTH_LEN, 100, &sm) == 0);
+	ATF_CHECK(stamp_sender_reply(s, late, STAMP_UNAUTH_LEN, 100,
+	    NULL, &sm) == 0);
 	stamp_sender_stats(s, st);
 	ATF_CHECK_EQ(st->late, 1);
 	stamp_sender_free(s);
@@ -634,8 +635,8 @@ ATF_TC_BODY(sender_window, tc)
 	 * apart, there being no reply before them. */
 	ATF_REQUIRE(sendrefl(s, r, 2, 0, false, out, &rcl) > 0);
 	ATF_CHECK_EQ(rcl, 1);
-	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 2.01, &sm) ==
-	    1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 2.01,
+	    NULL, &sm) == 1);
 	ATF_CHECK_EQ(sm.seq, 4);
 	ATF_CHECK_EQ(sm.r.seq, 0);
 	ATF_CHECK(stamp_sender_expire(s, 2.5, &sm) == 0);
@@ -672,7 +673,7 @@ ATF_TC_BODY(sender_restart, tc)
 	for (i = 0; i < 5; i++) {
 		ATF_REQUIRE(sendrefl(s, r, 1 + i, 0, false, out, NULL) > 0);
 		ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 1.01 +
-		    i, &sm) == 1);
+		    i, NULL, &sm) == 1);
 	}
 	/* One lost, and the reflector started again: its counter from 0,
 	 * the gap not told apart. */
@@ -681,8 +682,8 @@ ATF_TC_BODY(sender_restart, tc)
 	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
 	ATF_REQUIRE(sendrefl(s, r, 7, 0, false, out, NULL) > 0);
 	ATF_CHECK(stamp_sender_expire(s, 7.5, &sm) == 1);
-	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 7.01, &sm) ==
-	    1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 7.01,
+	    NULL, &sm) == 1);
 	stamp_sender_stats(s, &st);
 	ATF_CHECK_EQ(st.lost, 1);
 	ATF_CHECK_EQ(st.unknown_lost, 1);
@@ -691,8 +692,8 @@ ATF_TC_BODY(sender_restart, tc)
 	(void)sendrefl(s, r, 8, 0, true, out, NULL);
 	ATF_REQUIRE(sendrefl(s, r, 9, 0, false, out, NULL) > 0);
 	ATF_CHECK(stamp_sender_expire(s, 9.5, &sm) == 1);
-	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 9.01, &sm) ==
-	    1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 9.01,
+	    NULL, &sm) == 1);
 	stamp_sender_stats(s, &st);
 	ATF_CHECK_EQ(st.fwd_lost, 1);
 	ATF_CHECK_EQ(st.back_lost, 0);
@@ -700,8 +701,288 @@ ATF_TC_BODY(sender_restart, tc)
 	stamp_refl_free(r);
 }
 
+ATF_TC_WITHOUT_HEAD(clock_set);
+ATF_TC_BODY(clock_set, tc)
+{
+	struct stamp_clock	c;
+
+	ATF_REQUIRE(stamp_clock_set("ptp:0.000001") == 0);
+	stamp_clock_get(&c);
+	ATF_CHECK_EQ(c.sync, STAMP_SYNC_PTP);
+	ATF_CHECK(c.ee & STAMP_EE_S);
+	ATF_CHECK(stamp_ee_seconds(c.ee) >= 0.000001 &&
+	    stamp_ee_seconds(c.ee) < 0.0000011);
+	ATF_CHECK_EQ(stamp_ee_clock(), c.ee);
+	ATF_REQUIRE(stamp_clock_set("gnss") == 0);
+	stamp_clock_get(&c);
+	ATF_CHECK(c.sync == STAMP_SYNC_GNSS && (c.ee & STAMP_EE_S));
+	ATF_CHECK(stamp_ee_seconds(c.ee) < 0.000001);
+	/* Free-running: not synchronised. */
+	ATF_REQUIRE(stamp_clock_set("local:2") == 0);
+	stamp_clock_get(&c);
+	ATF_CHECK(c.sync == STAMP_SYNC_LOCAL && !(c.ee & STAMP_EE_S));
+	errno = 0;
+	ATF_CHECK(stamp_clock_set("sundial") == -1 && errno == EINVAL);
+	ATF_CHECK(stamp_clock_set("ntp:") == -1);
+	ATF_CHECK(stamp_clock_set("ntp:-1") == -1);
+	ATF_CHECK(stamp_clock_set("ntp:1x") == -1);
+	/* The kernel's again: ntp or free-running, as it says. */
+	ATF_REQUIRE(stamp_clock_set(NULL) == 0);
+	stamp_clock_get(&c);
+	ATF_CHECK(c.sync == ((c.ee & STAMP_EE_S) ? STAMP_SYNC_NTP :
+	    STAMP_SYNC_LOCAL));
+	ATF_CHECK_STREQ(stamp_sync_name(STAMP_SYNC_PTP), "ptp");
+	ATF_CHECK_STREQ(stamp_sync_name(0), "-");
+	ATF_CHECK_STREQ(stamp_sync_name(200), "200");
+	ATF_CHECK_STREQ(stamp_tsm_name(STAMP_TSM_HW), "hw");
+	ATF_CHECK_STREQ(stamp_tsm_name(STAMP_TSM_CP), "cp");
+}
+
+ATF_TC_WITHOUT_HEAD(tlv_tsinfo);
+ATF_TC_BODY(tlv_tsinfo, tc)
+{
+	struct stamp_refl_conf	 c = { .stateful = false, .port = 862 };
+	struct stamp_sender_conf sc = { .tsinfo = true };
+	struct sockaddr_in	 a = sin4("192.0.2.1", 40000);
+	struct stamp_refl	*r;
+	struct stamp_sender	*s;
+	struct stamp_tsinfo	 ti;
+	struct stamp_tlv	 v;
+	struct stamp_rx		 rx;
+	struct timespec		 t1;
+	uint8_t			 p[128], out[STAMP_PKT_MAX];
+	size_t			 off;
+	int			 i;
+
+	/* Built: the TLV, its value, past the packet refused. */
+	memset(p, 0xaa, sizeof(p));
+	off = 0;
+	ATF_REQUIRE(stamp_tlv_put(p, 52, &off, STAMP_TLV_TSINFO, "\0\0\0\0",
+	    4) == 0);
+	ATF_CHECK_EQ(off, 52);
+	ATF_CHECK(p[44] == 0 && p[45] == 3 && p[46] == 0 && p[47] == 4);
+	errno = 0;
+	ATF_CHECK(stamp_tlv_put(p, 55, &off, STAMP_TLV_PAD, NULL, 0) == -1 &&
+	    errno == EMSGSIZE);
+	ATF_REQUIRE(stamp_tlv_put(p, 60, &off, STAMP_TLV_PAD, NULL, 4) == 0);
+	ATF_CHECK(p[53] == 1 && p[55] == 4 && p[56] == 0xaa);
+	/* Found; one the reflector did not know (U) is none, as none at
+	 * all; TLVs past the packet before it, an error. */
+	ATF_CHECK(stamp_tsinfo_find(p, 60, &ti) == 1);
+	p[44] = STAMP_TLV_U;
+	ATF_CHECK(stamp_tsinfo_find(p, 60, &ti) == 0);
+	ATF_CHECK(stamp_tsinfo_find(p, 44, &ti) == 0);
+	p[44] = 0;
+	p[45] = STAMP_TLV_PAD;
+	ATF_CHECK(stamp_tsinfo_find(p, 60, &ti) == 0);
+	ATF_CHECK(stamp_tsinfo_find(p, 58, &ti) == -1);
+
+	/* The sender's packet: as long as the TLVs need. */
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_CHECK_EQ(stamp_sender_len(s, 0), 52);
+	ATF_CHECK_EQ(stamp_sender_len(s, 44), 52);
+	ATF_CHECK_EQ(stamp_sender_len(s, 53), 56);
+	ATF_CHECK_EQ(stamp_sender_len(s, 55), 56);
+	ATF_CHECK_EQ(stamp_sender_len(s, 100), 100);
+	clock_gettime(CLOCK_REALTIME, &t1);
+	errno = 0;
+	ATF_CHECK(stamp_sender_packet(s, p, 54, &t1, 1, NULL) == -1 &&
+	    errno == EMSGSIZE);
+	for (i = 0; i < (int)sizeof(p); i++)
+		p[i] = (uint8_t)i;
+	ATF_REQUIRE(stamp_sender_packet(s, p, 100, &t1, 1, NULL) == 0);
+	off = 0;
+	ATF_REQUIRE(stamp_tlv_next(p, 100, &off, &v) == 1);
+	ATF_CHECK(v.type == STAMP_TLV_TSINFO && v.len == 4 && v.flags == 0);
+	ATF_CHECK(v.value[0] == 0 && v.value[3] == 0);
+	ATF_REQUIRE(stamp_tlv_next(p, 100, &off, &v) == 1);
+	ATF_CHECK(v.type == STAMP_TLV_PAD && v.len == 44 && v.value[0] == 56);
+	ATF_CHECK(stamp_tlv_next(p, 100, &off, &v) == 0);
+
+	/* Reflected: filled, the hardware's T2, an unknown TLV marked,
+	 * the padding as it was; the reply as long. */
+	p[56] = 0;		/* an unknown TLV inside the padding's room */
+	p[57] = 99;
+	p[58] = 0;
+	p[59] = 40;
+	p[53] = STAMP_TLV_PAD;
+	p[55] = 0;
+	ATF_REQUIRE(stamp_clock_set("ptp:0.000001") == 0);
+	ATF_REQUIRE((r = stamp_refl_new(&c)) != NULL);
+	memset(&rx, 0, sizeof(rx));
+	rx.pkt = p;
+	rx.len = 100;
+	rx.peer = (struct sockaddr *)&a;
+	rx.t2 = t1;
+	rx.mono = 1;
+	rx.ts_in = STAMP_TSM_HW;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_REQUIRE(stamp_tsinfo_find(out, 100, &ti) == 1);
+	ATF_CHECK_EQ(ti.sync_in, STAMP_SYNC_PTP);
+	ATF_CHECK_EQ(ti.ts_in, STAMP_TSM_HW);
+	ATF_CHECK_EQ(ti.sync_out, STAMP_SYNC_PTP);
+	ATF_CHECK_EQ(ti.ts_out, STAMP_TSM_SW);
+	ATF_CHECK(out[52] == 0 && out[53] == STAMP_TLV_PAD);
+	ATF_CHECK(out[56] == STAMP_TLV_U && out[57] == 99);
+	ATF_CHECK(memcmp(out + 60, p + 60, 40) == 0);
+	stamp_refl_free(r);
+
+	/* Padding, not TLVs (a type 0, a length past the end): copied. */
+	c.ts_out = STAMP_TSM_CP;
+	ATF_REQUIRE((r = stamp_refl_new(&c)) != NULL);
+	for (i = 44; i < 100; i++)
+		p[i] = 0;
+	p[45] = STAMP_TLV_TSINFO;
+	p[47] = 4;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_CHECK(memcmp(out + 44, p + 44, 56) == 0);
+	p[53] = 99;
+	p[55] = 60;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_CHECK(memcmp(out + 44, p + 44, 56) == 0);
+	/* The TLV alone: filled, T3 the control plane's. */
+	ATF_REQUIRE(stamp_refl_reply(r, &(struct stamp_rx){ .pkt = p, .len = 52,
+	    .peer = (struct sockaddr *)&a, .t2 = t1, .mono = 1 }, out,
+	    sizeof(out), NULL) == 52);
+	ATF_REQUIRE(stamp_tsinfo_find(out, 52, &ti) == 1);
+	ATF_CHECK(ti.ts_in == STAMP_TSM_SW && ti.ts_out == STAMP_TSM_CP);
+	stamp_refl_free(r);
+	stamp_sender_free(s);
+	stamp_clock_set(NULL);
+}
+
+/*
+ * A packet of a sender asking for the Timestamp Information TLV, both
+ * clocks as clk says (the process's: the sender's and the reflector's
+ * the same), 30 ms out, 10 the reflector's, 5 back: its sample.
+ */
+static void
+owd_run(const char *clk, struct stamp_sample *sm)
+{
+	struct stamp_sender_conf sc = { .ssid = 9, .tsinfo = true };
+	struct stamp_refl_conf	 rc = { .stateful = true, .port = 862 };
+	struct sockaddr_in	 a = sin4("192.0.2.1", 40000);
+	struct stamp_sender	*s;
+	struct stamp_refl	*r;
+	struct stamp_rx		 rx;
+	struct timespec		 t1, t3, t4;
+	uint8_t			 p[64], out[STAMP_PKT_MAX];
+
+	ATF_REQUIRE(stamp_clock_set(clk) == 0);
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	t1.tv_sec = 1778400100;
+	t1.tv_nsec = 0;
+	ATF_REQUIRE(stamp_sender_packet(s, p, 52, &t1, 100, NULL) == 0);
+	memset(&rx, 0, sizeof(rx));
+	rx.pkt = p;
+	rx.len = 52;
+	rx.peer = (struct sockaddr *)&a;
+	rx.t2 = t1;
+	rx.t2.tv_nsec = 30000000;
+	rx.mono = 100.03;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 52);
+	t3 = rx.t2;
+	t3.tv_nsec = 40000000;
+	stamp_refl_send_time(out, &t3);
+	t4 = t1;
+	t4.tv_nsec = 45000000;
+	ATF_REQUIRE(stamp_sender_reply(s, out, 52, 100.045, &t4, sm) == 1);
+	ATF_CHECK_MSG(sm->rtt > 0.0349 && sm->rtt < 0.0351, "rtt %g", sm->rtt);
+	ATF_CHECK(sm->has_tsinfo);
+	stamp_refl_free(r);
+	stamp_sender_free(s);
+	stamp_clock_set(NULL);
+}
+
+ATF_TC_WITHOUT_HEAD(sender_owd);
+ATF_TC_BODY(sender_owd, tc)
+{
+	struct stamp_sample	sm;
+
+	/* Both synchronised, within a microsecond: one way each. */
+	owd_run("ptp:0.000001", &sm);
+	ATF_CHECK(sm.owd);
+	ATF_CHECK_MSG(sm.fwd > 0.0299 && sm.fwd < 0.0301, "fwd %g", sm.fwd);
+	ATF_CHECK_MSG(sm.back > 0.0049 && sm.back < 0.0051, "back %g",
+	    sm.back);
+	ATF_CHECK(sm.err > 0.000002 && sm.err < 0.0000022);
+	ATF_CHECK_EQ(sm.tsinfo.sync_in, STAMP_SYNC_PTP);
+	ATF_CHECK_EQ(sm.tsinfo.ts_out, STAMP_TSM_SW);
+	/* Free-running: half the round trip each, an estimate. */
+	owd_run("local:0.000001", &sm);
+	ATF_CHECK(!sm.owd);
+	ATF_CHECK_MSG(sm.fwd > 0.0174 && sm.fwd < 0.0176, "fwd %g", sm.fwd);
+	ATF_CHECK_EQ(sm.fwd, sm.back);
+	ATF_CHECK_EQ(sm.tsinfo.sync_in, STAMP_SYNC_LOCAL);
+	/* Synchronised, but 2 ms of error is more than a tenth of the
+	 * 17.5 ms each way; 0.8 ms is not. */
+	owd_run("ntp:0.001", &sm);
+	ATF_CHECK(!sm.owd);
+	ATF_CHECK_EQ(sm.fwd, sm.rtt / 2);
+	owd_run("ntp:0.0008", &sm);
+	ATF_CHECK(sm.owd);
+}
+
+ATF_TC_WITHOUT_HEAD(sender_owd_bounds);
+ATF_TC_BODY(sender_owd_bounds, tc)
+{
+	struct stamp_sender_conf sc = { .ssid = 9, .owd_frac = 0.5 };
+	struct stamp_refl_conf	 rc = { .stateful = false, .port = 862 };
+	struct sockaddr_in	 a = sin4("192.0.2.1", 40000);
+	struct stamp_sender	*s;
+	struct stamp_refl	*r;
+	struct stamp_sample	 sm;
+	struct stamp_rx		 rx;
+	struct timespec		 t1, t4;
+	uint8_t			 p[STAMP_UNAUTH_LEN], out[STAMP_PKT_MAX];
+	int			 i;
+
+	ATF_REQUIRE(stamp_clock_set("ntp:0.001") == 0);
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	for (i = 0; i < 3; i++) {
+		t1.tv_sec = 1778400200 + i;
+		t1.tv_nsec = 0;
+		ATF_REQUIRE(stamp_sender_packet(s, p, sizeof(p), &t1, 200 + i,
+		    NULL) == 0);
+		memset(&rx, 0, sizeof(rx));
+		rx.pkt = p;
+		rx.len = sizeof(p);
+		rx.peer = (struct sockaddr *)&a;
+		rx.mono = 200 + i;
+		/* The reflector's clock 1 s behind (i 1): the way out
+		 * negative; the reply's time of day unknown (i 2). */
+		rx.t2 = t1;
+		rx.t2.tv_nsec = 10000000;
+		if (i == 1)
+			rx.t2.tv_sec--;
+		ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) ==
+		    STAMP_UNAUTH_LEN);
+		stamp_refl_send_time(out, &rx.t2);
+		t4 = t1;
+		t4.tv_nsec = 20000000;
+		ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 200 +
+		    i + 0.02, i == 2 ? NULL : &t4, &sm) == 1);
+		/* No TLV asked for: none. */
+		ATF_CHECK(!sm.has_tsinfo);
+		/* 2 ms of error within half of the 10 ms each way. */
+		ATF_CHECK_MSG(sm.owd == (i == 0), "%d: owd %d", i, sm.owd);
+		ATF_CHECK_MSG(sm.fwd > 0.0099 && sm.fwd < 0.0101, "%d: fwd %g",
+		    i, sm.fwd);
+	}
+	stamp_refl_free(r);
+	stamp_sender_free(s);
+	stamp_clock_set(NULL);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
+
+	ATF_TP_ADD_TC(tp, clock_set);
+	ATF_TP_ADD_TC(tp, tlv_tsinfo);
+	ATF_TP_ADD_TC(tp, sender_owd);
+	ATF_TP_ADD_TC(tp, sender_owd_bounds);
 
 	ATF_TP_ADD_TC(tp, sender_rtt);
 	ATF_TP_ADD_TC(tp, sender_loss_stateful);

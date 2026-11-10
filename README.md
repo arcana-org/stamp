@@ -1,18 +1,24 @@
 # stamp
 
 The Simple Two-way Active Measurement Protocol (STAMP, RFC 8762) for
-FreeBSD, with the Session-Sender Identifier of RFC 8972: a library, a
-Session-Reflector daemon and a sender.
+FreeBSD, with the Session-Sender Identifier and the Timestamp
+Information TLV of RFC 8972: a library, a Session-Reflector daemon and
+a sender.
 
 - **libstamp(3)**: the packets of the unauthenticated mode (room left
-  for the authenticated one and read access to RFC 8972's TLVs), NTP
-  and PTP timestamps, the Error Estimate (RFC 4656) from
-  `ntp_gettime(2)`, the Session-Reflector's core (stateless or
-  stateful sessions, per-source and global rate limits, the reply), the
-  Session-Sender's core (a session's sequence, the replies matched, the
-  round trip with the reflector's time taken out, the loss on the way
-  out told from the loss on the way back by a stateful reflector's
-  counter), and the UDP socket of either end (in a FIB by `SO_SETFIB`;
+  for the authenticated one; RFC 8972's TLVs read and written, the
+  Timestamp Information TLV filled by the reflector), NTP and PTP
+  timestamps, the Error Estimate (RFC 4656) and the clock's
+  synchronisation source from `ntp_gettime(2)` (or as the process says,
+  for a clock the kernel does not know is synchronised), the
+  Session-Reflector's core (stateless or stateful sessions, per-source
+  and global rate limits, the reply), the Session-Sender's core (a
+  session's sequence, the replies matched, the round trip with the
+  reflector's time taken out, the delay each way when both Error
+  Estimates say synchronised and their errors together are within a
+  tenth of half the round trip, else half the round trip flagged an
+  estimate, the loss on the way out told from the loss on the way back
+  by a stateful reflector's counter), and the UDP socket of either end (in a FIB by `SO_SETFIB`;
   kernel receive timestamps by `SO_TS_REALTIME`, or `SO_TS_MONOTONIC`
   for a sender, the TTL and destination address by
   `IP_RECVTTL`/`IP_RECVDSTADDR`/`IPV6_RECVPKTINFO`, the reply from the
@@ -23,7 +29,8 @@ Session-Reflector daemon and a sender.
   (`chroot(2)` to `/var/empty`, the user `_stampd`); configuration
   read again on `SIGHUP`; syslog.
 - **stamp(1)**: send N test packets at an interval, print each reply's
-  fields and the round trip, then the loss, each way from a stateful
+  fields, the round trip and the delay each way (`-T` asks for the
+  Timestamp Information TLV), then the loss, each way from a stateful
   reflector.
 
 ## FIBs, the base way

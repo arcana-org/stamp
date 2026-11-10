@@ -7,8 +7,9 @@
 /*
  * The UDP socket of either end.  The time a packet came in is the
  * kernel's (SO_TIMESTAMP with SO_TS_CLOCK SO_TS_REALTIME, an
- * SCM_REALTIME timespec; a sender's SO_TS_MONOTONIC, SCM_MONOTONIC),
- * the TTL or Hop Limit it came with is said
+ * SCM_REALTIME timespec; a sender's SO_TS_MONOTONIC, SCM_MONOTONIC,
+ * the other clock's derived from it; SCM_TIME_INFO saying whether the
+ * hardware took it), the TTL or Hop Limit it came with is said
  * (IP_RECVTTL, IPV6_RECVHOPLIMIT), and the address it came to
  * (IP_RECVDSTADDR, IPV6_RECVPKTINFO), so that a reply leaves from it
  * (IP_SENDSRCADDR, IPV6_PKTINFO).  The socket's FIB is the process's,
@@ -153,6 +154,13 @@ stamp_recv(int fd, uint8_t *buf, size_t len, struct stamp_rxinfo *ri)
 			memcpy(&tv, CMSG_DATA(cm), sizeof(tv));
 			TIMEVAL_TO_TIMESPEC(&tv, &ri->t);
 			have_t = true;
+		} else if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type ==
+		    SCM_TIME_INFO && cm->cmsg_len >=
+		    CMSG_LEN(sizeof(struct sock_timestamp_info))) {
+			struct sock_timestamp_info	sti;
+
+			memcpy(&sti, CMSG_DATA(cm), sizeof(sti));
+			ri->hwts = (sti.st_info_flags & ST_INFO_HW) != 0;
 		} else if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type ==
 		    IP_RECVTTL && cm->cmsg_len >= CMSG_LEN(1)) {
 			ri->ttl = *(uint8_t *)CMSG_DATA(cm);
@@ -185,10 +193,27 @@ stamp_recv(int fd, uint8_t *buf, size_t len, struct stamp_rxinfo *ri)
 				s6->sin6_scope_id = pi6.ipi6_ifindex;
 		}
 	}
-	if (!have_t)
-		clock_gettime(CLOCK_REALTIME, &ri->t);
-	if (!have_m)
-		clock_gettime(CLOCK_MONOTONIC, &ri->mono);
+	/*
+	 * The kernel says one clock: the other is the same instant on
+	 * it, the two clocks' difference now added (a sender's T4 on the
+	 * time of day from the kernel's monotonic time).
+	 */
+	if (!have_t || !have_m) {
+		struct timespec	rt, mt;
+
+		clock_gettime(CLOCK_REALTIME, &rt);
+		clock_gettime(CLOCK_MONOTONIC, &mt);
+		if (!have_t && !have_m) {
+			ri->t = rt;
+			ri->mono = mt;
+		} else if (!have_t) {
+			timespecsub(&rt, &mt, &rt);
+			timespecadd(&ri->mono, &rt, &ri->t);
+		} else {
+			timespecsub(&mt, &rt, &mt);
+			timespecadd(&ri->t, &mt, &ri->mono);
+		}
+	}
 	return (n);
 }
 
