@@ -116,6 +116,19 @@ parse_total(const char *s, struct stamp_refl_conf *c)
 }
 
 static bool
+parse_location(const char *s, struct stamp_refl_conf *c)
+{
+
+	if (strcmp(s, "show") == 0)
+		c->loc_hide = false;
+	else if (strcmp(s, "hide") == 0)
+		c->loc_hide = true;
+	else
+		return (false);
+	return (true);
+}
+
+static bool
 parse_mode(const char *s, struct stamp_refl_conf *c)
 {
 
@@ -217,11 +230,12 @@ conf_read(struct stamp_refl_conf *c, char *why, size_t whylen)
 		    !((strcmp(key, "mode") == 0 && parse_mode(val, c)) ||
 		    (strcmp(key, "rate") == 0 && parse_rate(val, c)) ||
 		    (strcmp(key, "rate-total") == 0 && parse_total(val, c)) ||
-		    (strcmp(key, "dscp-refuse") == 0 && parse_dscps(val, c)))) {
+		    (strcmp(key, "dscp-refuse") == 0 && parse_dscps(val, c)) ||
+		    (strcmp(key, "location") == 0 && parse_location(val, c)))) {
 			(void)snprintf(why, whylen, "%s, line %d: \"%s\" is not "
 			    "mode stateless|stateful, rate rate[/burst], "
-			    "rate-total rate or dscp-refuse all|none|d,d,...",
-			    conf_name, n, key);
+			    "rate-total rate, dscp-refuse all|none|d,d,... or "
+			    "location show|hide", conf_name, n, key);
 			error = -1;
 		}
 	}
@@ -259,9 +273,10 @@ conf_say(const struct stamp_refl_conf *c, const char *what)
 		    c->rate_total);
 	else
 		(void)snprintf(total, sizeof(total), "no limit in all");
-	syslog(LOG_INFO, "%s: %s, %s, %s, %d DSCPs refused a reply", what,
-	    c->stateful ? "stateful" : "stateless", rate, total,
-	    __builtin_popcountll(c->dscp_deny));
+	syslog(LOG_INFO, "%s: %s, %s, %s, %d DSCPs refused a reply, "
+	    "locations %s", what, c->stateful ? "stateful" : "stateless", rate,
+	    total, __builtin_popcountll(c->dscp_deny), c->loc_hide ? "hidden" :
+	    "shown");
 }
 
 /* The packets waiting on fd, each answered or dropped. */

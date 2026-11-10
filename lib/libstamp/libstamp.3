@@ -15,6 +15,9 @@
 .Nm stamp_tlv_put ,
 .Nm stamp_tsinfo_find ,
 .Nm stamp_cos_find ,
+.Nm stamp_dm_find ,
+.Nm stamp_location_find ,
+.Nm stamp_location_nat ,
 .Nm stamp_ntp_put ,
 .Nm stamp_ntp_get ,
 .Nm stamp_ptp_put ,
@@ -74,6 +77,12 @@ STAMP Library
 .Fn stamp_tsinfo_find "const uint8_t *pkt" "size_t len" "struct stamp_tsinfo *ti"
 .Ft int
 .Fn stamp_cos_find "const uint8_t *pkt" "size_t len" "struct stamp_cos *cos"
+.Ft int
+.Fn stamp_dm_find "const uint8_t *pkt" "size_t len" "struct stamp_dm *dm"
+.Ft int
+.Fn stamp_location_find "const uint8_t *pkt" "size_t len" "struct stamp_location *loc"
+.Ft int
+.Fn stamp_location_nat "const struct stamp_location *loc" "const struct sockaddr *self" "const struct sockaddr *far"
 .Ft void
 .Fn stamp_ntp_put "uint8_t *p" "const struct timespec *ts"
 .Ft void
@@ -157,7 +166,8 @@ The
 .Nm
 library implements the Simple Two-way Active Measurement Protocol
 (STAMP, RFC 8762) with the Session-Sender Identifier and the
-Timestamp Information and Class of Service TLVs of RFC 8972:
+Location, Timestamp Information, Class of Service and Direct
+Measurement TLVs of RFC 8972:
 its packets in unauthenticated mode, its timestamps and error
 estimate, the clock's synchronisation, the Session-Reflector's core,
 the Session-Sender's core and the UDP socket of either end.
@@ -165,8 +175,9 @@ It has no other dependency than the C library.
 The authenticated mode
 .Pq Dv STAMP_AUTH , No 112 octets and an HMAC
 is not implemented yet; of the TLVs that follow the base packet, the
-Timestamp Information and Class of Service TLVs are filled by the
-reflector and read by the sender, the others marked unrecognised.
+Location, Timestamp Information, Class of Service and Direct
+Measurement TLVs are filled by the reflector and read by the sender,
+the others marked unrecognised.
 .Ss Packets
 .Fn stamp_test_encode
 writes a Session-Sender test packet
@@ -240,6 +251,42 @@ those the request reached the reflector with; and
 1 when the reflector would not set
 .Va dscp1 ,
 its reply carrying the request's DSCP instead.
+.Fn stamp_dm_find
+reads the Direct Measurement TLV
+.Pq Dv STAMP_TLV_DM , No section 4.5
+into
+.Vt struct stamp_dm :
+.Va s_tx ,
+the packets the sender sent in the session, that one with them;
+.Va r_rx
+and
+.Va r_tx ,
+those the reflector received and sent in it; 0 too when the reflector
+counted none
+.Pq Va r_rx No 0 , No a stateless one .
+.Fn stamp_location_find
+reads the Location TLV
+.Pq Dv STAMP_TLV_LOCATION , No section 4.2
+into
+.Vt struct stamp_location :
+.Va src
+and
+.Va dst ,
+the address and port the request came from and to as the reflector saw
+them, from its Source and Destination IPv4 or IPv6 Address sub-TLVs;
+one not said (zero, the reflector hiding it or not knowing) of family
+0; 0 too when its sub-TLVs run past it.
+.Fn stamp_location_nat
+says what of that was rewritten on the way:
+.Dv STAMP_NAT_SRC
+when the source is not
+.Fa self ,
+the address and port this end sent from (a port of 0 not compared),
+.Dv STAMP_NAT_DST
+when the destination is not
+.Fa far ,
+the address and port it sent to; NULL, or what the TLV does not say,
+not compared.
 .Ss Timestamps and the error estimate
 .Fn stamp_ntp_put
 and
@@ -352,6 +399,9 @@ The DSCPs a Class of Service TLV may not ask the reply to carry, bit
 for DSCP
 .Ar n :
 their replies carry the DSCP the request came with, the TLV's RP 1.
+.It Va loc_hide
+A Location TLV's ports and addresses are not said (zero), as RFC 8972
+lets a reflector's policy.
 .El
 .Pp
 .Fn stamp_refl_setconf
@@ -375,8 +425,18 @@ and
 for T3), the Class of Service TLV too (DSCP2 and ECN from
 .Va tos ,
 the TOS or traffic class octet the request came with, \-1 not known),
-one of those too short or, the Class of Service TLV, not of 4 octets
-marked malformed
+the Direct Measurement TLV (the session's requests received, one over
+a rate limit among them, and replies sent; 0 each when stateless) and
+the Location TLV (the reflector's port, or the one
+.Va local
+says, and the sender's; each sub-TLV asking for the source or
+destination address answered in the packet's family, the destination
+the address it came to, zero when
+.Va local
+is NULL; one asking for the source MAC answered as an EUI-64 of zero,
+no UDP socket seeing it; another marked unrecognised); one of those
+too short, not as long as its kind is (Class of Service 4, Direct
+Measurement 12) or whose sub-TLVs run past it marked malformed
 .Pq Dv STAMP_TLV_M ,
 and any other but Extra Padding marked unrecognised
 .Pq Dv STAMP_TLV_U ;
@@ -433,6 +493,12 @@ the caller sends them with the DSCP it wants
 .Pq Dv IP_TOS , IPV6_TCLASS
 and reads the DSCP the replies came with
 .Pq Fn stamp_recv .
+.It Va dm
+The packets carry the Direct Measurement TLV, their count in the
+session, for the loss each way by counters.
+.It Va location
+The packets carry the Location TLV, asking for the destination and
+source addresses: what a NAT on the way rewrote.
 .It Va owd_frac
 The delay each way is said one way when the two error estimates
 together are no more than this part of half the round trip
@@ -452,18 +518,20 @@ its timestamp
 it returns 0, or 1 when the window was full and its oldest packet
 given up, lost, that one's sample in
 .Fa *lostp .
-With
-.Va tsinfo
+With any of
+.Va tsinfo , cos , dm
 or
-.Va cos ,
-the Timestamp Information TLV and the Class of Service TLV follow the
-base, in that order, empty but for DSCP1, and an Extra Padding TLV
-the rest,
+.Va location ,
+the Timestamp Information, Class of Service, Direct Measurement and
+Location TLVs follow the base, in that order, empty but for DSCP1, the
+count of packets sent and the sub-TLVs asking for the addresses, and
+an Extra Padding TLV the rest,
 .Fa len
 as
 .Fn stamp_sender_len
-says: the base's 44 octets at least, 8 more for each TLV, and with
-more after them 4 octets or more
+says: the base's 44 octets at least, 8 more for each of the first two
+TLVs, 16 for the Direct Measurement TLV and 48 for the Location TLV,
+and with more after them 4 octets or more
 .Pq else Er EMSGSIZE ;
 .Fn stamp_sender_len
 is that length for one of
@@ -508,7 +576,17 @@ the reflector's Timestamp Information TLV;
 .Va has_cos
 and
 .Va cos
-its Class of Service TLV; and
+its Class of Service TLV;
+.Va has_dm
+and
+.Va dm
+its Direct Measurement TLV, when it counted, with
+.Va s_rx
+the replies received here, that one with them;
+.Va has_loc
+and
+.Va loc
+its Location TLV; and
 .Va r
 the reply.
 .Fn stamp_sender_expire
@@ -540,6 +618,18 @@ the later one is answered or lost, up to a timeout after; those after
 the last reply are in
 .Va lost
 alone.
+With
+.Va dm ,
+the Direct Measurement TLV's counters tell the loss each way too,
+summed from the first reply that has them
+.Pq Va dm_told :
+between two such replies, the packets sent less those the reflector
+received were lost on the way out
+.Pq Va dm_fwd_lost ,
+the replies it sent less those received here on the way back
+.Pq Va dm_back_lost , No a late one among them ;
+a reply before one sent earlier is passed over, and counters that went
+back (the reflector started again) start the next part of the sum.
 .Fn stamp_mode_name
 names a mode.
 .Ss Sockets

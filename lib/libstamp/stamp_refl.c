@@ -15,16 +15,19 @@
  * counts the packets reflected in the session (4.3.2), a session the
  * caller's tag (a FIB), the sender's address and port, the address the
  * packet came to and the SSID, so that the sender tells loss on the
- * way out from loss on the way back.  Sessions are bounded (sess_max,
+ * way out from loss on the way back; a session also counts the requests
+ * it received (one over a rate limit among them) and the replies it
+ * made, for RFC 8972's Direct Measurement TLV, which a stateless
+ * reflector answers with zeros.  Sessions are bounded (sess_max,
  * the oldest replaced when full) and end after sess_idle seconds
  * without a packet.
  *
  * A reflector answers whoever writes a source address, so it is no
  * amplifier and no firehose.  Only a packet of STAMP_UNAUTH_LEN octets
  * or more is answered, the reply exactly as long, what follows the
- * base copied (padding, TLVs; the Timestamp Information and Class of
- * Service TLVs filled, those not known marked so).  Not one from port 0 nor from the
- * reflector's own port (two reflectors made to answer each other
+ * base copied (padding, TLVs; the Timestamp Information, Class of
+ * Service, Direct Measurement and Location TLVs filled, those not known
+ * marked so).  Not one from port 0 nor from the reflector's own port (two reflectors made to answer each other
  * forever by one forged packet).  And no more replies to one source
  * address than its token bucket allows, nor to all of them together
  * than one more: the sources' buckets a table of RL_SLOTS, RL_WAYS a
@@ -56,6 +59,7 @@ struct sess {
 	struct sockaddr_storage	 peer;		/* address and port */
 	struct sockaddr_storage	 local;		/* address only */
 	uint32_t		 seq;		/* the next reflected */
+	uint32_t		 rx, tx;	/* received, sent: RFC 8972 4.5 */
 	double			 last;
 	int			 next;		/* in its bucket; -1 the end */
 };
@@ -205,12 +209,12 @@ stamp_refl_expire(struct stamp_refl *r, double now)
 			sess_unlink(r, (int)i);
 }
 
-/* The session's next Sequence Number, the session made if new (the
- * oldest replaced when the table is full). */
-static uint32_t
-sess_seq(struct stamp_refl *r, int tag, uint16_t ssid,
+/* The session, made if new and create (the oldest replaced when the
+ * table is full), else NULL. */
+static struct sess *
+sess_get(struct stamp_refl *r, int tag, uint16_t ssid,
     const struct sockaddr_storage *peer, const struct sockaddr_storage *local,
-    double now)
+    double now, bool create)
 {
 	struct sess	*s;
 	unsigned	 b;
@@ -222,9 +226,11 @@ sess_seq(struct stamp_refl *r, int tag, uint16_t ssid,
 		if (s->tag == tag && s->ssid == ssid && addr_eq(&s->peer, peer,
 		    true) && addr_eq(&s->local, local, false)) {
 			s->last = now;
-			return (s->seq++);
+			return (s);
 		}
 	}
+	if (!create)
+		return (NULL);
 	free_i = old_i = -1;
 	for (i = 0; i < (int)r->nsessmax; i++) {
 		if (!r->sess[i].used) {
@@ -246,11 +252,10 @@ sess_seq(struct stamp_refl *r, int tag, uint16_t ssid,
 	s->peer = *peer;
 	s->local = *local;
 	s->last = now;
-	s->seq = 1;
 	s->next = r->bucket[b];
 	r->bucket[b] = free_i;
 	r->nsess++;
-	return (0);
+	return (s);
 }
 
 /* ---- Rate ------------------------------------------------------- */
@@ -404,18 +409,110 @@ cos_reflect(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *v)
 	v[2] = v[3] = 0;
 }
 
+/* An address's octets, an IPv4 one's 4 or an IPv6 one's 16, into a
+ * Location sub-TLV's value v (16 octets, zero first; all zero when
+ * hidden or not known); its type, t4 or t6 by the packet's family. */
+static uint8_t
+loc_put(uint8_t *v, const struct sockaddr *sa, uint8_t t4, uint8_t t6,
+    int af, bool hide)
+{
+
+	memset(v, 0, 16);
+	if (sa != NULL && !hide && sa->sa_family == AF_INET)
+		memcpy(v, &((const struct sockaddr_in *)(const void *)sa)->
+		    sin_addr, 4);
+	else if (sa != NULL && !hide && sa->sa_family == AF_INET6)
+		memcpy(v, &((const struct sockaddr_in6 *)(const void *)sa)->
+		    sin6_addr, 16);
+	return (af == AF_INET ? t4 : t6);
+}
+
+/*
+ * The Location TLV's value v (vlen octets; RFC 8972 4.2): the ports the
+ * request came to and from, and each sub-TLV asking for an address
+ * answered in the packet's family, the source the sender's address as
+ * it reached here, the destination the one it came to (zero when not
+ * known); a source MAC (no UDP socket sees it) answered as an EUI-64
+ * of zero; another marked unrecognised.  The ports and addresses zero
+ * when the configuration hides them.  false when its sub-TLVs go past
+ * it, nothing changed.
+ */
+static bool
+loc_reflect(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *v,
+    uint16_t vlen)
+{
+	uint16_t	dport, sport, slen;
+	uint8_t		*p;
+	size_t		at;
+	int		af = rx->peer->sa_family;
+	bool		hide = r->c.loc_hide;
+
+	for (at = 4; at < vlen; at += 4 + (size_t)slen) {
+		if (vlen - at < 4)
+			return (false);
+		slen = (uint16_t)(v[at + 2] << 8 | v[at + 3]);
+		if (vlen - at - 4 < slen)
+			return (false);
+	}
+	dport = hide ? 0 : r->c.port;
+	if (!hide && rx->local != NULL && stamp_sa_port(rx->local) != 0)
+		dport = stamp_sa_port(rx->local);
+	sport = hide ? 0 : stamp_sa_port(rx->peer);
+	v[0] = (uint8_t)(dport >> 8);
+	v[1] = (uint8_t)dport;
+	v[2] = (uint8_t)(sport >> 8);
+	v[3] = (uint8_t)sport;
+	for (at = 4; at < vlen; at += 4 + (size_t)slen) {
+		p = v + at;
+		slen = (uint16_t)(p[2] << 8 | p[3]);
+		if (p[1] == STAMP_SUB_SRCIP && slen == 16)
+			p[1] = loc_put(p + 4, rx->peer, STAMP_SUB_SRCIP4,
+			    STAMP_SUB_SRCIP6, af, hide);
+		else if (p[1] == STAMP_SUB_DSTIP && slen == 16)
+			p[1] = loc_put(p + 4, rx->local, STAMP_SUB_DSTIP4,
+			    STAMP_SUB_DSTIP6, af, hide);
+		else if (p[1] == STAMP_SUB_SRCMAC && slen == 8) {
+			p[1] = STAMP_SUB_EUI64;
+			memset(p + 4, 0, 8);
+		} else
+			p[0] |= STAMP_TLV_U;
+	}
+	return (true);
+}
+
+/* The Direct Measurement TLV's value v (RFC 8972 4.5): the sender's
+ * counter as it is, the session's received and sent; 0 each when
+ * stateless (no session to count in). */
+static void
+dm_reflect(const struct sess *s, uint8_t *v)
+{
+	uint32_t	rx = s != NULL ? s->rx : 0, tx = s != NULL ? s->tx : 0;
+
+	v[4] = (uint8_t)(rx >> 24);
+	v[5] = (uint8_t)(rx >> 16);
+	v[6] = (uint8_t)(rx >> 8);
+	v[7] = (uint8_t)rx;
+	v[8] = (uint8_t)(tx >> 24);
+	v[9] = (uint8_t)(tx >> 16);
+	v[10] = (uint8_t)(tx >> 8);
+	v[11] = (uint8_t)tx;
+}
+
 /*
  * The TLVs of a reply of len octets, copied from the request (RFC 8972
  * 4): the Timestamp Information TLV filled (the clock's source, how T2
- * and T3 are taken), the Class of Service TLV too (cos_reflect()), one
- * of either too short marked malformed (M), any other but Extra Padding
- * marked unrecognised (U).  What follows the base is TLVs only when it
+ * and T3 are taken), the Class of Service TLV too (cos_reflect()), the
+ * Direct Measurement TLV (dm_reflect()) and the Location TLV
+ * (loc_reflect()); one of them too short, not as long as its kind is
+ * (Class of Service 4, Direct Measurement 12) or whose sub-TLVs go past
+ * it marked malformed (M), any other but Extra Padding marked
+ * unrecognised (U).  What follows the base is TLVs only when it
  * is TLVs to its end, none of type 0: anything else is a sender's
  * padding (a TWAMP Light sender's zeros, a pattern), copied as it is.
  */
 static void
-tlvs_reflect(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *out,
-    size_t len)
+tlvs_reflect(struct stamp_refl *r, const struct stamp_rx *rx,
+    const struct sess *s, uint8_t *out, size_t len)
 {
 	struct stamp_tlv	v;
 	size_t			off, at;
@@ -455,6 +552,18 @@ tlvs_reflect(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *out,
 			}
 			cos_reflect(r, rx, out + at + 4);
 			break;
+		case STAMP_TLV_DM:
+			if (v.len != 12) {
+				out[at] |= STAMP_TLV_M;
+				break;
+			}
+			dm_reflect(s, out + at + 4);
+			break;
+		case STAMP_TLV_LOCATION:
+			if (v.len < 4 || !loc_reflect(r, rx, out + at + 4,
+			    v.len))
+				out[at] |= STAMP_TLV_M;
+			break;
 		default:
 			out[at] |= STAMP_TLV_U;
 		}
@@ -481,6 +590,7 @@ stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
     uint8_t *out, size_t outlen, enum stamp_drop *why)
 {
 	struct sockaddr_storage	 peer, local;
+	struct sess		*s = NULL;
 	const uint8_t		*in = rx->pkt;
 	enum stamp_drop		 w;
 	uint32_t		 seq;
@@ -490,6 +600,15 @@ stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
 
 	now = rx->mono != 0 ? rx->mono : stamp_mono();
 	r->reply_tos = -1;
+	/* The sender's SSID; 0 from a TWAMP Light sender (its MBZ). */
+	ssid = rx->len >= STAMP_UNAUTH_LEN ? (uint16_t)(in[14] << 8 | in[15]) :
+	    0;
+	if (r->c.stateful) {
+		sa_copy(&peer, rx->peer);
+		sa_copy(&local, rx->local);
+		if (rx->local == NULL)
+			local.ss_family = rx->peer->sa_family;
+	}
 	w = STAMP_ANSWERED;
 	if (rx->len < STAMP_UNAUTH_LEN)
 		w = STAMP_DROP_SHORT;
@@ -505,6 +624,10 @@ stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
 	}
 	if (why != NULL)
 		*why = w;
+	/* Over a rate, a session's request is still one it received. */
+	if (w == STAMP_DROP_RATE && r->c.stateful && (s = sess_get(r, rx->tag,
+	    ssid, &peer, &local, now, false)) != NULL)
+		s->rx++;
 	if (w != STAMP_ANSWERED) {
 		r->st.dropped[w]++;
 		return (-1);
@@ -514,14 +637,11 @@ stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
 	memset(out, 0, STAMP_UNAUTH_LEN);
 	memcpy(out + STAMP_UNAUTH_LEN, in + STAMP_UNAUTH_LEN, rx->len -
 	    STAMP_UNAUTH_LEN);
-	/* The sender's SSID; 0 from a TWAMP Light sender (its MBZ). */
-	ssid = (uint16_t)(in[14] << 8 | in[15]);
 	if (r->c.stateful) {
-		sa_copy(&peer, rx->peer);
-		sa_copy(&local, rx->local);
-		if (rx->local == NULL)
-			local.ss_family = rx->peer->sa_family;
-		seq = sess_seq(r, rx->tag, ssid, &peer, &local, now);
+		s = sess_get(r, rx->tag, ssid, &peer, &local, now, true);
+		seq = s->seq++;
+		s->rx++;
+		s->tx++;
 		out[0] = (uint8_t)(seq >> 24);
 		out[1] = (uint8_t)(seq >> 16);
 		out[2] = (uint8_t)(seq >> 8);
@@ -542,7 +662,7 @@ stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
 	memcpy(out + 28, in + 4, 8);		/* ... Timestamp */
 	memcpy(out + 36, in + 12, 2);		/* ... Error Estimate */
 	out[40] = (uint8_t)(rx->ttl > 0 ? rx->ttl : 0);	/* ... TTL */
-	tlvs_reflect(r, rx, out, rx->len);
+	tlvs_reflect(r, rx, s, out, rx->len);
 	r->st.answered++;
 	return ((ssize_t)rx->len);
 }

@@ -1,14 +1,17 @@
 # stamp
 
 The Simple Two-way Active Measurement Protocol (STAMP, RFC 8762) for
-FreeBSD, with the Session-Sender Identifier and the Timestamp
-Information and Class of Service TLVs of RFC 8972: a library, a Session-Reflector daemon and
+FreeBSD, with the Session-Sender Identifier and the Location,
+Timestamp Information, Class of Service and Direct Measurement TLVs of
+RFC 8972: a library, a Session-Reflector daemon and
 a sender.
 
 - **libstamp(3)**: the packets of the unauthenticated mode (room left
   for the authenticated one; RFC 8972's TLVs read and written, the
   Timestamp Information TLV filled by the reflector, the Class of
-  Service TLV too, the DSCP each way told), NTP and PTP
+  Service TLV too, the DSCP each way told, the Direct Measurement TLV
+  from its sessions' counters, the Location TLV from the addresses and
+  ports a request came with, a NAT on the way told), NTP and PTP
   timestamps, the Error Estimate (RFC 4656) and the clock's
   synchronisation source from `ntp_gettime(2)` (or as the process says,
   for a clock the kernel does not know is synchronised), the
@@ -33,7 +36,9 @@ a sender.
 - **stamp(1)**: send N test packets at an interval, print each reply's
   fields, the round trip and the delay each way (`-T` asks for the
   Timestamp Information TLV, `-D` for the Class of Service TLV: the
-  DSCP each way), then the loss, each way from a stateful reflector.
+  DSCP each way, `-L` for the Location TLV: a NAT on the way, `-M` for
+  the Direct Measurement TLV), then the loss, each way from a stateful
+  reflector, by its sequence and by the counters.
 
 ## FIBs, the base way
 

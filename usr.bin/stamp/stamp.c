@@ -13,8 +13,10 @@
  * stateful, and the delay each way, one way when both clocks allow,
  * else half the round trip.  -T asks for the reflector's Timestamp
  * Information TLV; -D sends the packets with a DSCP and asks, by the
- * Class of Service TLV, for the replies to come back with it; -C says
- * this clock's synchronisation.  A TWAMP
+ * Class of Service TLV, for the replies to come back with it; -M asks
+ * for the Direct Measurement TLV (the loss each way by counters), -L
+ * for the Location TLV (a NAT on the way seen); -C says this clock's
+ * synchronisation.  A TWAMP
  * Light sender's packet by -l (14 octets and its padding).  In the FIB
  * the process is in: setfib(1).
  */
@@ -48,7 +50,7 @@ static void
 usage(void)
 {
 
-	fprintf(stderr, "usage: stamp [-T] [-C source[:error]] [-c count] "
+	fprintf(stderr, "usage: stamp [-LMT] [-C source[:error]] [-c count] "
 	    "[-D dscp[/reply]]\n"
 	    "             [-i interval] [-l length] [-m mode] [-p port] "
 	    "[-q seq]\n"
@@ -97,6 +99,56 @@ cos_say(const struct stamp_sample *sm, const struct stamp_rxinfo *ri)
 	return (buf);
 }
 
+/* The Direct Measurement TLV's counters, " dm=S_TxC/R_RxC/R_TxC/S_RxC",
+ * "dm=-" when the reflector did not count. */
+static const char *
+dm_say(const struct stamp_sample *sm)
+{
+	static char	buf[64];
+
+	if (!sm->has_dm)
+		return (" dm=-");
+	(void)snprintf(buf, sizeof(buf), " dm=%u/%u/%u/%u", sm->dm.s_tx,
+	    sm->dm.r_rx, sm->dm.r_tx, sm->s_rx);
+	return (buf);
+}
+
+/* An address and port as "a:p", "[a]:p" for IPv6, "-" not said. */
+static const char *
+ap(const struct sockaddr_storage *ss, char *buf, size_t len)
+{
+	char	a[64];
+
+	if (ss->ss_family == 0)
+		(void)snprintf(buf, len, "-");
+	else
+		(void)snprintf(buf, len, ss->ss_family == AF_INET6 ? "[%s]:%u" :
+		    "%s:%u", stamp_sa_ntop((const struct sockaddr *)ss, a,
+		    sizeof(a)), stamp_sa_port((const struct sockaddr *)ss));
+	return (buf);
+}
+
+/* The Location TLV: " src=a:p dst=a:p nat=src,dst|none", the source
+ * and destination as the reflector saw them, and what of them is not
+ * this end's address and port (self) and the one it sent to (far). */
+static const char *
+loc_say(const struct stamp_sample *sm, const struct sockaddr *self,
+    const struct sockaddr *far)
+{
+	static char	buf[160];
+	char		s1[64], s2[64];
+	int		nat;
+
+	if (!sm->has_loc)
+		return (" src=- dst=- nat=-");
+	nat = stamp_location_nat(&sm->loc, self, far);
+	(void)snprintf(buf, sizeof(buf), " src=%s dst=%s nat=%s",
+	    ap(&sm->loc.src, s1, sizeof(s1)), ap(&sm->loc.dst, s2, sizeof(s2)),
+	    nat == 0 ? "none" : nat == STAMP_NAT_SRC ? "src" : nat ==
+	    STAMP_NAT_DST ? "dst" : "src,dst");
+	return (buf);
+}
+
 /* The reflector's Timestamp Information, "-" with none. */
 static const char *
 tsinfo(const struct stamp_sample *sm)
@@ -131,7 +183,8 @@ main(int argc, char *argv[])
 	struct stamp_sender_stats st;
 	struct stamp_sample	  sm;
 	struct stamp_rxinfo	  ri;
-	struct sockaddr_storage	  to;
+	struct sockaddr_storage	  to, self;
+	socklen_t		  slen;
 	struct timespec		  t1, ts;
 	struct kevent		  kev;
 	uint8_t			  pkt[STAMP_PKT_MAX], in[STAMP_PKT_MAX];
@@ -146,7 +199,7 @@ main(int argc, char *argv[])
 	int			  sport = 0, rc, dscp = -1, v;
 
 	memset(&sc, 0, sizeof(sc));
-	while ((ch = getopt(argc, argv, "C:c:D:i:l:m:p:q:S:s:Tt:W:")) != -1)
+	while ((ch = getopt(argc, argv, "C:c:D:i:Ll:Mm:p:q:S:s:Tt:W:")) != -1)
 		switch (ch) {
 		case 'C':
 			if (stamp_clock_set(optarg) == -1)
@@ -155,6 +208,12 @@ main(int argc, char *argv[])
 			break;
 		case 'T':
 			sc.tsinfo = true;
+			break;
+		case 'L':
+			sc.location = true;
+			break;
+		case 'M':
+			sc.dm = true;
 			break;
 		case 'c':
 			count = (unsigned long)num("c", optarg, 1, 1000000);
@@ -240,7 +299,7 @@ main(int argc, char *argv[])
 	for (i = STAMP_UNAUTH_LEN; i < sizeof(pkt); i++)
 		pkt[i] = (uint8_t)i;
 	pad = STAMP_UNAUTH_LEN;
-	if (sc.tsinfo || sc.cos) {
+	if (sc.tsinfo || sc.cos || sc.dm || sc.location) {
 		len = stamp_sender_len(snd, len);
 		plen = len;
 		pad = stamp_sender_len(snd, 0);
@@ -290,6 +349,24 @@ main(int argc, char *argv[])
 			}
 			at = (double)ri.mono.tv_sec + (double)ri.mono.tv_nsec /
 			    1e9;
+			/* This end as it sent: the address the reply came to,
+			 * the socket's port. */
+			memset(&self, 0, sizeof(self));
+			slen = sizeof(self);
+			if (ri.local.ss_family != 0 && getsockname(fd,
+			    (struct sockaddr *)&self, &slen) == 0) {
+				uint16_t	sp = stamp_sa_port((struct sockaddr *)
+				    &self);
+
+				self = ri.local;
+				if (self.ss_family == AF_INET)
+					((struct sockaddr_in *)(void *)&self)->
+					    sin_port = htons(sp);
+				else
+					((struct sockaddr_in6 *)(void *)&self)->
+					    sin6_port = htons(sp);
+			} else
+				memset(&self, 0, sizeof(self));
 			/* Another's, late, again: passed over. */
 			if (stamp_sender_reply(snd, in, (size_t)n, at, &ri.t,
 			    &sm) != 1)
@@ -297,7 +374,7 @@ main(int argc, char *argv[])
 			printf("len=%zd from=%s seq=%u ssid=%u sseq=%u ttl=%u "
 			    "rttl=%d echo=%s order=%s clock=%s serr=%s mbz=%s "
 			    "pad=%s rtt=%.3f fwd=%.3f back=%.3f owd=%s err=%.6f "
-			    "ti=%s%s\n", n,
+			    "ti=%s%s%s%s\n", n,
 			    stamp_sa_ntop((struct sockaddr *)&ri.peer, from,
 			    sizeof(from)), sm.r.seq, sm.r.ssid, sm.r.sseq,
 			    sm.r.sttl, ri.ttl, ok(memcmp(in + 28,
@@ -310,7 +387,9 @@ main(int argc, char *argv[])
 			    (size_t)n - pad) == 0), sm.rtt * 1e3, sm.fwd * 1e3,
 			    sm.back * 1e3, sm.owd ? "measured" : "estimated",
 			    sm.err * 1e3, tsinfo(&sm), sc.cos ? cos_say(&sm, &ri) :
-			    "");
+			    "", sc.dm ? dm_say(&sm) : "", sc.location ?
+			    loc_say(&sm, self.ss_family != 0 ? (struct sockaddr *)
+			    &self : NULL, (struct sockaddr *)&to) : "");
 			fsum += sm.fwd;
 			bsum += sm.back;
 			if (sm.owd)
@@ -339,6 +418,11 @@ main(int argc, char *argv[])
 			    "measured=%lu", min * 1e3, sum / (double)st.received *
 			    1e3, max * 1e3, fsum / (double)st.received * 1e3,
 			    bsum / (double)st.received * 1e3, measured);
+		if (sc.dm && st.dm_told)
+			printf(" dm_forward=%ju dm_backward=%ju",
+			    (uintmax_t)st.dm_fwd_lost, (uintmax_t)st.dm_back_lost);
+		else if (sc.dm)
+			printf(" dm_forward=- dm_backward=-");
 		printf("\n");
 	}
 	stamp_sender_free(snd);

@@ -561,6 +561,69 @@ cos_cleanup()
 	stop
 }
 
+atf_test_case dm_location cleanup
+dm_location_head()
+{
+	atf_set "descr" "The Direct Measurement TLV through a relay that drops" \
+	    "every 5th packet out and every 7th reply back: the loss each way" \
+	    "by counters, the same as by the stateful counter, none told by a" \
+	    "stateless reflector; the Location TLV: the address and port each" \
+	    "request came from and to, as sent when direct, rewritten (a NAT)" \
+	    "through the relay; hidden by location hide"
+	atf_set "timeout" "60"
+}
+dm_location_body()
+{
+	local L
+
+	L=$(atf_get_srcdir)/udplossy
+	P=$(port)
+	R=$(port)
+	SP=$(port)
+	start -p $P -r 0
+	# Direct: as this end sent, no NAT; the counters this session's.
+	atf_check -o save:direct.out "$S" -L -M -S $SP -p $P -c 3 -i 0 \
+	    127.0.0.1
+	atf_check -o match:"^len=108 .* pad=ok .* ti=- dm=1/1/1/1 src=127\.0\.0\.1:$SP dst=127\.0\.0\.1:$P nat=none$" \
+	    -o match:"^len=108 .* dm=3/3/3/3 src=127\.0\.0\.1:$SP dst=127\.0\.0\.1:$P nat=none$" \
+	    -o match:' dm_forward=0 dm_backward=0$' cat direct.out
+	if has_inet6; then
+		atf_check -o match:"^len=108 from=::1 .* dm=1/1/1/1 src=\[::1\]:$SP dst=\[::1\]:$P nat=none$" \
+		    "$S" -L -M -S $SP -p $P ::1
+	fi
+	# Through the relay: 5 lost out, 3 back, by counters as by the
+	# reflector's sequence; the source the relay's, the port its.
+	"$L" $R $P 5 7 > relay.out 2>&1 &
+	echo $! > relay.pid
+	wait_match '^ready$' cat relay.out || atf_fail "no relay"
+	atf_check -o save:relay.txt "$S" -L -M -S $SP -p $R -c 29 -i 0.01 \
+	    -W 0.5 127.0.0.1
+	atf_check -o match:'^sent=29 received=21 lost=8 forward=5 backward=3 unknown=0 reflector=stateful .* dm_forward=5 dm_backward=3$' \
+	    tail -1 relay.txt
+	atf_check -o inline:'21\n' grep -c \
+	    "^len=108 .* src=127\.0\.0\.1:[0-9]* dst=127\.0\.0\.1:$P nat=src,dst$" \
+	    relay.txt
+	atf_check -s exit:1 -o inline:'0\n' grep -c "src=127\.0\.0\.1:$SP " \
+	    relay.txt
+	stop
+	# Stateless: nothing counted, nothing told.
+	start -p $P -r 0 -m stateless
+	atf_check -o match:'^len=108 .* dm=- src=' -o match:' dm_forward=- dm_backward=-$' \
+	    "$S" -L -M -p $P -c 2 -i 0 127.0.0.1
+	stop
+	# Hidden: neither ports nor addresses said.
+	echo 'location hide' > l.conf
+	start -p $P -r 0 -f "$(pwd)/l.conf"
+	atf_check -o match:'started: .* locations hidden' cat d.out
+	atf_check -o match:'^len=100 .* ti=[a-z]+/sw,[a-z]+/sw src=- dst=- nat=none$' \
+	    "$S" -T -L -p $P 127.0.0.1
+}
+dm_location_cleanup()
+{
+	[ -f relay.pid ] && kill "$(cat relay.pid)" 2>/dev/null
+	stop
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case stateless
@@ -573,4 +636,5 @@ atf_init_test_cases()
 	atf_add_test_case loss
 	atf_add_test_case owd
 	atf_add_test_case cos
+	atf_add_test_case dm_location
 }

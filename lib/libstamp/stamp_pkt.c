@@ -12,7 +12,13 @@
  * Timestamp Information TLV (4.3, type 3) four octets, the sync source
  * and timestamping method of T2, then of T3; the Class of Service TLV
  * (4.4, type 4) four, DSCP1 (6 bits), DSCP2 (6), ECN (2), RP (2) and
- * 16 reserved.  The
+ * 16 reserved; the Direct Measurement TLV (4.5, type 5) twelve, the
+ * sender's transmit counter and the reflector's receive and transmit
+ * counters; the Location TLV (4.2, type 2) the destination and source
+ * ports and sub-TLVs, each laid out as a TLV, the sender's asking for
+ * an address (Destination IP Address, 4; Source IP Address, 7; 16
+ * octets of zero) and the reflector's answering it in the packet's
+ * family (5 or 6, 8 or 9: an IPv4 address in the first 4).  The
  * authenticated mode's (4.2.2, 4.3.2) would be STAMP_AUTH_LEN octets
  * and an HMAC: not yet.
  *
@@ -23,7 +29,13 @@
  *		TTL, 41 MBZ
  */
 
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include <netinet/in.h>
+
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -226,4 +238,137 @@ stamp_cos_find(const uint8_t *pkt, size_t len, struct stamp_cos *cos)
 	cos->ecn = (v.value[1] >> 2) & 0x03;
 	cos->rp = v.value[1] & 0x03;
 	return (1);
+}
+
+/* The Direct Measurement TLV of a reflected packet into dm: as
+ * tlv_find(), and 0 too when the reflector counted nothing (R_RxC 0:
+ * a stateless one; one that counts has this request among them). */
+int
+stamp_dm_find(const uint8_t *pkt, size_t len, struct stamp_dm *dm)
+{
+	struct stamp_tlv	v;
+	int			rc;
+
+	if ((rc = tlv_find(pkt, len, STAMP_TLV_DM, 12, &v)) != 1)
+		return (rc);
+	dm->s_tx = get32(v.value);
+	dm->r_rx = get32(v.value + 4);
+	dm->r_tx = get32(v.value + 8);
+	return (dm->r_rx != 0 ? 1 : 0);
+}
+
+/* An address of family af (alen octets at a) and port into ss; left
+ * unsaid (family 0) when it is all zeros. */
+static void
+loc_addr(struct sockaddr_storage *ss, int af, const uint8_t *a, size_t alen,
+    uint16_t port)
+{
+	static const uint8_t	zero[16];
+
+	memset(ss, 0, sizeof(*ss));
+	if (memcmp(a, zero, alen) == 0)
+		return;
+	if (af == AF_INET) {
+		struct sockaddr_in	*s4 = (struct sockaddr_in *)(void *)ss;
+
+		s4->sin_family = AF_INET;
+		s4->sin_len = sizeof(*s4);
+		memcpy(&s4->sin_addr, a, 4);
+		s4->sin_port = htons(port);
+	} else {
+		struct sockaddr_in6	*s6 = (struct sockaddr_in6 *)(void *)ss;
+
+		s6->sin6_family = AF_INET6;
+		s6->sin6_len = sizeof(*s6);
+		memcpy(&s6->sin6_addr, a, 16);
+		s6->sin6_port = htons(port);
+	}
+}
+
+/*
+ * The Location TLV of a reflected packet into loc (RFC 8972 4.2): the
+ * ports, and the addresses of its sub-TLVs as the reflector answered
+ * them (Destination and Source IPv4 or IPv6 Address).  As tlv_find();
+ * its sub-TLVs going past it, malformed: 0.
+ */
+int
+stamp_location_find(const uint8_t *pkt, size_t len,
+    struct stamp_location *loc)
+{
+	struct stamp_tlv	 v;
+	const uint8_t		*p;
+	uint16_t		 dport, sport, slen;
+	size_t			 at;
+	int			 rc;
+
+	memset(loc, 0, sizeof(*loc));
+	if ((rc = tlv_find(pkt, len, STAMP_TLV_LOCATION, 4, &v)) != 1)
+		return (rc);
+	dport = get16(v.value);
+	sport = get16(v.value + 2);
+	for (at = 4; at < v.len; at += 4 + (size_t)slen) {
+		if (v.len - at < 4)
+			return (0);
+		p = v.value + at;
+		slen = get16(p + 2);
+		if (v.len - at - 4 < slen)
+			return (0);
+		if (p[0] & (STAMP_TLV_U | STAMP_TLV_M))
+			continue;
+		if (p[1] == STAMP_SUB_DSTIP4 && slen >= 4)
+			loc_addr(&loc->dst, AF_INET, p + 4, 4, dport);
+		else if (p[1] == STAMP_SUB_DSTIP6 && slen >= 16)
+			loc_addr(&loc->dst, AF_INET6, p + 4, 16, dport);
+		else if (p[1] == STAMP_SUB_SRCIP4 && slen >= 4)
+			loc_addr(&loc->src, AF_INET, p + 4, 4, sport);
+		else if (p[1] == STAMP_SUB_SRCIP6 && slen >= 16)
+			loc_addr(&loc->src, AF_INET6, p + 4, 16, sport);
+	}
+	return (1);
+}
+
+/* a and b the same address, and port unless b's is 0. */
+static bool
+sa_same(const struct sockaddr_storage *a, const struct sockaddr *b)
+{
+	const struct sockaddr_in	*a4, *b4;
+	const struct sockaddr_in6	*a6, *b6;
+
+	if (a->ss_family != b->sa_family)
+		return (false);
+	if (b->sa_family == AF_INET) {
+		a4 = (const struct sockaddr_in *)(const void *)a;
+		b4 = (const struct sockaddr_in *)(const void *)b;
+		return (a4->sin_addr.s_addr == b4->sin_addr.s_addr &&
+		    (b4->sin_port == 0 || a4->sin_port == b4->sin_port));
+	}
+	if (b->sa_family == AF_INET6) {
+		a6 = (const struct sockaddr_in6 *)(const void *)a;
+		b6 = (const struct sockaddr_in6 *)(const void *)b;
+		return (memcmp(&a6->sin6_addr, &b6->sin6_addr, 16) == 0 &&
+		    (b6->sin6_port == 0 || a6->sin6_port == b6->sin6_port));
+	}
+	return (false);
+}
+
+/*
+ * What loc says was rewritten between this end and the reflector:
+ * STAMP_NAT_SRC when the source it saw is not self (the address and
+ * port this end sent from; port 0 not compared), STAMP_NAT_DST when the
+ * destination is not far (the address and port it sent to); what loc
+ * does not say, or self or far NULL, not compared.
+ */
+int
+stamp_location_nat(const struct stamp_location *loc,
+    const struct sockaddr *self, const struct sockaddr *far)
+{
+	int	nat = 0;
+
+	if (self != NULL && loc->src.ss_family != 0 && !sa_same(&loc->src,
+	    self))
+		nat |= STAMP_NAT_SRC;
+	if (far != NULL && loc->dst.ss_family != 0 && !sa_same(&loc->dst,
+	    far))
+		nat |= STAMP_NAT_DST;
+	return (nat);
 }

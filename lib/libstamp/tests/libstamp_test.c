@@ -1077,10 +1077,254 @@ ATF_TC_BODY(tlv_cos, tc)
 	stamp_sender_free(s);
 }
 
+/*
+ * The Direct Measurement TLV (RFC 8972 4.5): the sender's counter; a
+ * stateful reflector's received and sent in the session (one over the
+ * rate received, not sent), a stateless one's 0, not counted; the loss
+ * each way by them, a reordered reply passed over, a reflector started
+ * again a new start.  Malformed when not 12 octets.
+ */
+ATF_TC_WITHOUT_HEAD(tlv_dm);
+ATF_TC_BODY(tlv_dm, tc)
+{
+	struct stamp_refl_conf	  c = { .stateful = true, .port = 862 };
+	struct stamp_sender_conf  sc = { .dm = true, .ssid = 4 };
+	struct sockaddr_in	  a = sin4("192.0.2.1", 40000);
+	struct stamp_refl	 *r;
+	struct stamp_sender	 *s;
+	struct stamp_sender_stats st;
+	struct stamp_sample	  sm;
+	struct stamp_dm		  dm;
+	struct stamp_tlv	  v;
+	struct stamp_rx		  rx;
+	struct timespec		  t1;
+	enum stamp_drop		  why;
+	uint8_t			  p[8][64], out[8][STAMP_PKT_MAX];
+	size_t			  off;
+	int			  i;
+
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_CHECK_EQ(stamp_sender_len(s, 0), 60);
+	ATF_REQUIRE((r = stamp_refl_new(&c)) != NULL);
+	clock_gettime(CLOCK_REALTIME, &t1);
+	memset(&rx, 0, sizeof(rx));
+	rx.len = 60;
+	rx.peer = (struct sockaddr *)&a;
+	rx.t2 = t1;
+	/* Eight packets: the 2nd lost going, the 4th's reply lost coming,
+	 * the 6th's and 7th's replies swapped. */
+	for (i = 0; i < 8; i++) {
+		ATF_REQUIRE(stamp_sender_packet(s, p[i], 60, &t1, 1 + i * 0.1,
+		    NULL) == 0);
+		off = 0;
+		ATF_REQUIRE(stamp_tlv_next(p[i], 60, &off, &v) == 1);
+		ATF_CHECK(v.type == STAMP_TLV_DM && v.len == 12);
+		ATF_CHECK(v.value[3] == i + 1 && v.value[7] == 0 &&
+		    v.value[11] == 0);
+		if (i == 1)
+			continue;
+		rx.pkt = p[i];
+		rx.mono = 1 + i * 0.1;
+		ATF_REQUIRE(stamp_refl_reply(r, &rx, out[i], sizeof(out[i]),
+		    NULL) == 60);
+	}
+	ATF_REQUIRE(stamp_dm_find(out[0], 60, &dm) == 1);
+	ATF_CHECK(dm.s_tx == 1 && dm.r_rx == 1 && dm.r_tx == 1);
+	ATF_REQUIRE(stamp_dm_find(out[7], 60, &dm) == 1);
+	ATF_CHECK(dm.s_tx == 8 && dm.r_rx == 7 && dm.r_tx == 7);
+	for (i = 0; i < 8; i++) {
+		if (i == 1 || i == 3)
+			continue;
+		ATF_REQUIRE(stamp_sender_reply(s, out[i == 5 ? 6 : i == 6 ? 5 :
+		    i], 60, 1.05 + i * 0.1, NULL, &sm) == 1);
+		ATF_CHECK(sm.has_dm);
+	}
+	stamp_sender_stats(s, &st);
+	ATF_CHECK(st.dm_told);
+	ATF_CHECK_EQ(st.dm_fwd_lost, 1);
+	ATF_CHECK_EQ(st.dm_back_lost, 1);
+	ATF_CHECK_EQ(sm.s_rx, 6);
+
+	/* Over the rate: received, not sent; a stateless reflector's 0,
+	 * none found. */
+	c.rate = 1;
+	c.burst = 1;
+	ATF_REQUIRE(stamp_refl_setconf(r, &c) == 0);
+	rx.pkt = p[7];
+	rx.mono = 10;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out[0], sizeof(out[0]), NULL) ==
+	    60);
+	ATF_CHECK(stamp_refl_reply(r, &rx, out[1], sizeof(out[1]), &why) ==
+	    -1 && why == STAMP_DROP_RATE);
+	rx.mono = 12;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out[1], sizeof(out[1]), NULL) ==
+	    60);
+	ATF_REQUIRE(stamp_dm_find(out[1], 60, &dm) == 1);
+	ATF_CHECK_EQ(dm.r_rx, 10);
+	ATF_CHECK_EQ(dm.r_tx, 9);
+	c.stateful = false;
+	c.rate = 0;
+	ATF_REQUIRE(stamp_refl_setconf(r, &c) == 0);
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out[0], sizeof(out[0]), NULL) ==
+	    60);
+	ATF_CHECK(stamp_dm_find(out[0], 60, &dm) == 0);
+	ATF_CHECK(dm.s_tx == 8 && dm.r_rx == 0 && dm.r_tx == 0);
+	/* Not 12 octets: malformed. */
+	memcpy(p[0], p[7], 60);
+	p[0][47] = 8;
+	off = 44 + 4 + 8;
+	ATF_REQUIRE(stamp_tlv_put(p[0], 60, &off, STAMP_TLV_PAD, NULL, 0) == 0);
+	rx.pkt = p[0];
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out[0], sizeof(out[0]), NULL) ==
+	    60);
+	ATF_CHECK(out[0][44] == STAMP_TLV_M);
+	ATF_CHECK(stamp_dm_find(out[0], 60, &dm) == 0);
+	stamp_refl_free(r);
+	stamp_sender_free(s);
+}
+
+/*
+ * The Location TLV (RFC 8972 4.2): the ports and the source and
+ * destination addresses the request came with, in its family; a NAT
+ * on the way told; hidden by the configuration; a source MAC an EUI-64
+ * of zero, an unknown sub-TLV marked, sub-TLVs past it malformed.
+ */
+ATF_TC_WITHOUT_HEAD(tlv_location);
+ATF_TC_BODY(tlv_location, tc)
+{
+	struct stamp_refl_conf	 c = { .stateful = false, .port = 862 };
+	struct stamp_sender_conf sc = { .location = true, .tsinfo = true };
+	struct sockaddr_in	 a = sin4("192.0.2.1", 40000);
+	struct sockaddr_in	 l = sin4("198.51.100.7", 0);
+	struct sockaddr_in	 self = sin4("10.0.0.1", 40000);
+	struct sockaddr_in	 far = sin4("198.51.100.7", 862);
+	struct sockaddr_in6	 a6 = sin6("2001:db8::1", 40001);
+	struct sockaddr_in6	 l6 = sin6("2001:db8::2", 0);
+	struct sockaddr_in6	 far6 = sin6("2001:db8::2", 862);
+	struct stamp_refl	*r;
+	struct stamp_sender	*s;
+	struct stamp_sample	 sm;
+	struct stamp_location	 loc;
+	struct stamp_tlv	 v;
+	struct stamp_rx		 rx;
+	struct timespec		 t1;
+	uint8_t			 p[128], out[STAMP_PKT_MAX];
+	size_t			 off;
+
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_CHECK_EQ(stamp_sender_len(s, 0), 100);
+	clock_gettime(CLOCK_REALTIME, &t1);
+	ATF_REQUIRE(stamp_sender_packet(s, p, 100, &t1, 1, NULL) == 0);
+	off = 52;
+	ATF_REQUIRE(stamp_tlv_next(p, 100, &off, &v) == 1);
+	ATF_CHECK(v.type == STAMP_TLV_LOCATION && v.len == 44);
+	ATF_CHECK(v.value[0] == 0 && v.value[3] == 0);
+	ATF_CHECK(v.value[5] == STAMP_SUB_DSTIP && v.value[7] == 16);
+	ATF_CHECK(v.value[25] == STAMP_SUB_SRCIP && v.value[27] == 16);
+	/* Asked, not answered: none said. */
+	ATF_CHECK(stamp_location_find(p, 100, &loc) == 1);
+	ATF_CHECK(loc.src.ss_family == 0 && loc.dst.ss_family == 0);
+
+	/* IPv4: what it came from and to. */
+	ATF_REQUIRE((r = stamp_refl_new(&c)) != NULL);
+	memset(&rx, 0, sizeof(rx));
+	rx.pkt = p;
+	rx.len = 100;
+	rx.peer = (struct sockaddr *)&a;
+	rx.local = (struct sockaddr *)&l;
+	rx.t2 = t1;
+	rx.mono = 1;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	off = 52;
+	ATF_REQUIRE(stamp_tlv_next(out, 100, &off, &v) == 1);
+	ATF_CHECK(v.value[0] == 862 >> 8 && v.value[1] == (862 & 0xff));
+	ATF_CHECK(v.value[2] == 40000 >> 8 && v.value[3] == (40000 & 0xff));
+	ATF_CHECK(v.value[5] == STAMP_SUB_DSTIP4 && v.value[25] ==
+	    STAMP_SUB_SRCIP4);
+	ATF_CHECK(v.value[8] == 198 && v.value[11] == 7 && v.value[12] == 0);
+	ATF_CHECK(v.value[28] == 192 && v.value[31] == 1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, 100, 1.01, NULL, &sm) == 1);
+	ATF_REQUIRE(sm.has_loc);
+	ATF_CHECK_EQ(sm.loc.src.ss_family, AF_INET);
+	ATF_CHECK_EQ(stamp_sa_port((struct sockaddr *)&sm.loc.src), 40000);
+	ATF_CHECK_EQ(stamp_sa_port((struct sockaddr *)&sm.loc.dst), 862);
+	/* From 10.0.0.1, seen from 192.0.2.1: the source rewritten; to
+	 * the address it reached, nothing else. */
+	ATF_CHECK_EQ(stamp_location_nat(&sm.loc, (struct sockaddr *)&self,
+	    (struct sockaddr *)&far), STAMP_NAT_SRC);
+	ATF_CHECK_EQ(stamp_location_nat(&sm.loc, (struct sockaddr *)&a,
+	    (struct sockaddr *)&far), 0);
+	self = a;
+	self.sin_port = htons(40002);
+	ATF_CHECK_EQ(stamp_location_nat(&sm.loc, (struct sockaddr *)&self,
+	    (struct sockaddr *)&far), STAMP_NAT_SRC);
+	self.sin_port = 0;
+	ATF_CHECK_EQ(stamp_location_nat(&sm.loc, (struct sockaddr *)&self,
+	    NULL), 0);
+	far.sin_port = htons(10862);
+	ATF_CHECK_EQ(stamp_location_nat(&sm.loc, NULL,
+	    (struct sockaddr *)&far), STAMP_NAT_DST);
+
+	/* IPv6; the address it came to not known: that one not said. */
+	rx.peer = (struct sockaddr *)&a6;
+	rx.local = NULL;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_REQUIRE(stamp_location_find(out, 100, &loc) == 1);
+	ATF_CHECK_EQ(loc.src.ss_family, AF_INET6);
+	ATF_CHECK(memcmp(&((struct sockaddr_in6 *)&loc.src)->sin6_addr,
+	    &a6.sin6_addr, 16) == 0);
+	ATF_CHECK_EQ(stamp_sa_port((struct sockaddr *)&loc.src), 40001);
+	ATF_CHECK_EQ(loc.dst.ss_family, 0);
+	rx.local = (struct sockaddr *)&l6;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_REQUIRE(stamp_location_find(out, 100, &loc) == 1);
+	ATF_CHECK_EQ(stamp_location_nat(&loc, (struct sockaddr *)&a6,
+	    (struct sockaddr *)&far6), 0);
+	off = 52;
+	ATF_REQUIRE(stamp_tlv_next(out, 100, &off, &v) == 1);
+	ATF_CHECK(v.value[5] == STAMP_SUB_DSTIP6 && v.value[25] ==
+	    STAMP_SUB_SRCIP6);
+
+	/* Hidden: nothing said. */
+	c.loc_hide = true;
+	ATF_REQUIRE(stamp_refl_setconf(r, &c) == 0);
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_REQUIRE(stamp_location_find(out, 100, &loc) == 1);
+	ATF_CHECK(loc.src.ss_family == 0 && loc.dst.ss_family == 0);
+	ATF_CHECK(out[56] == 0 && out[57] == 0 && out[58] == 0 &&
+	    out[59] == 0);
+	c.loc_hide = false;
+	ATF_REQUIRE(stamp_refl_setconf(r, &c) == 0);
+
+	/* A source MAC asked: an EUI-64 of zero; an unknown sub-TLV
+	 * marked; its source address still said. */
+	p[56 + 5] = STAMP_SUB_SRCMAC;
+	p[56 + 7] = 8;
+	p[56 + 16] = 0;		/* an 8-octet sub-TLV of type 99 after it */
+	p[56 + 17] = 99;
+	p[56 + 18] = 0;
+	p[56 + 19] = 4;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_CHECK(out[56 + 5] == STAMP_SUB_EUI64);
+	ATF_CHECK(out[56 + 16] == STAMP_TLV_U && out[56 + 17] == 99);
+	ATF_CHECK(out[56 + 25] == STAMP_SUB_SRCIP6);
+	ATF_REQUIRE(stamp_location_find(out, 100, &loc) == 1);
+	ATF_CHECK(loc.src.ss_family == AF_INET6 && loc.dst.ss_family == 0);
+	/* Sub-TLVs past it: malformed, none found. */
+	p[56 + 27] = 30;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_CHECK(out[52] == STAMP_TLV_M);
+	ATF_CHECK(stamp_location_find(out, 100, &loc) == 0);
+	stamp_refl_free(r);
+	stamp_sender_free(s);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
 	ATF_TP_ADD_TC(tp, tlv_cos);
+	ATF_TP_ADD_TC(tp, tlv_dm);
+	ATF_TP_ADD_TC(tp, tlv_location);
 	ATF_TP_ADD_TC(tp, clock_set);
 	ATF_TP_ADD_TC(tp, tlv_tsinfo);
 	ATF_TP_ADD_TC(tp, sender_owd);

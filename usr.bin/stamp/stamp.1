@@ -11,7 +11,7 @@
 .Nd send STAMP test packets
 .Sh SYNOPSIS
 .Nm
-.Op Fl T
+.Op Fl LMT
 .Op Fl C Ar source Ns Op : Ns Ar error
 .Op Fl c Ar count
 .Op Fl D Ar dscp Ns Op / Ns Ar reply
@@ -54,6 +54,14 @@ Ask for the reflector's Timestamp Information TLV (RFC 8972 section
 .Fl l
 adds beyond it is an Extra Padding TLV (the packet 52 octets at least,
 and 56 or more when longer).
+.It Fl L
+Ask for the reflector's Location TLV (RFC 8972 section 4.2): the
+addresses and ports each packet reached it from and to, which a NAT on
+the way rewrites; 48 octets more.
+.It Fl M
+Ask for the reflector's Direct Measurement TLV (RFC 8972 section 4.5):
+the packets sent, received by the reflector and sent back in the
+session, the loss each way by counters; 16 octets more.
 .It Fl C Ar source Ns Op : Ns Ar error
 This host's clock as it is, for one that
 .Xr ntp_gettime 2
@@ -159,6 +167,27 @@ reflector with, and RP 1 when the reflector would not send the reply
 with DSCP1
 .Pq Ql -
 when it did not fill it); and the DSCP the reply came back with.
+.It Cm dm
+With
+.Fl M :
+the packets this end sent in the session, the reflector received and
+sent in it, and this end received, as
+.Ql 3/3/3/3 ;
+.Ql -
+when the reflector does not count (a stateless one).
+.It Cm src , dst , nat
+With
+.Fl L :
+the address and port the packet came from and to as the reflector saw
+them
+.Pq Ql -
+not said), and what of them was rewritten on the way:
+.Cm src
+when the source is not the address the reply came to and this end's
+port,
+.Cm dst
+when the destination is not the one it was sent to, both, or
+.Cm none .
 .El
 .Pp
 With a count above 1, a last line says the packets
@@ -186,7 +215,14 @@ and
 .Cm back ,
 the delay each way, the mean; and
 .Cm measured ,
-how many replies' delay each way was by the two clocks.
+how many replies' delay each way was by the two clocks; with
+.Fl M ,
+.Cm dm_forward
+and
+.Cm dm_backward ,
+the loss each way by the Direct Measurement TLV's counters
+.Pq Ql -
+when the reflector counted none).
 .Sh EXIT STATUS
 .Nm
 exits 0 when a reply came, 2 when none did, and 1 on an error.
@@ -196,6 +232,7 @@ $ stamp -c 100 -i 0.1 192.0.2.1
 $ setfib 1 stamp -s 7 -l 200 2001:db8::1
 $ stamp -T -C ptp:0.000001 -c 10 192.0.2.1
 $ stamp -D 46 -c 10 192.0.2.1
+$ stamp -L -M -c 100 -i 0.1 192.0.2.1
 .Ed
 .Sh SEE ALSO
 .Xr setfib 1 ,

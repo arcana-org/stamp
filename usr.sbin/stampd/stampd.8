@@ -75,8 +75,19 @@ unless
 .Fl D
 refuses it: the reply then carries the DSCP the request came with,
 the TLV's RP 1.
-Another TLV but Extra Padding is marked unrecognised (its U flag), a
-Class of Service TLV not of 4 octets malformed (M).
+A Direct Measurement TLV (section 4.5) is filled with the requests
+the session received (one over the rate limits among them) and the
+replies it sent; stateless, with zeros, there being no session to
+count in.
+A Location TLV (section 4.2) is filled with the ports the request came
+to and from, and the addresses its sub-TLVs ask for, in the request's
+family: the source as the request came, the destination the address it
+came to; a source MAC, which no UDP socket sees, as an EUI-64 of zero;
+none of them with
+.Cm location hide .
+Another TLV but Extra Padding is marked unrecognised (its U flag); a
+Class of Service TLV not of 4 octets, a Direct Measurement TLV not of
+12 or a Location TLV whose sub-TLVs run past it malformed (M).
 What follows the base is taken as TLVs only when it is TLVs to its end,
 none of type 0; anything else, padding, is copied as it is.
 Nor is a packet from port 0 or from
@@ -170,6 +181,10 @@ As
 .It Cm dscp-refuse Ar dscps
 As
 .Fl D .
+.It Cm location Cm show | hide
+Whether a Location TLV says the ports and addresses a request came
+with; default
+.Cm show .
 .El
 .Pp
 What the command line sets is kept over the file's.

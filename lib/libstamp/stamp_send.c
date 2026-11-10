@@ -28,7 +28,20 @@
  * its reply with the DSCP dscp (the caller sends its packets with the
  * DSCP it wants, on its socket) and tells the DSCP and ECN the packet
  * reached the reflector with; the DSCP the reply came back with is the
- * caller's to read (stamp_recv()).
+ * caller's to read (stamp_recv()).  With location, the Location TLV
+ * (4.2) asks for the addresses and ports the packet reached the
+ * reflector with: a NAT on the way rewrote them (stamp_location_nat()).
+ *
+ * With dm, the Direct Measurement TLV (4.5) carries the packets sent in
+ * the session, this one with them, and comes back with what the
+ * reflector received and sent in it, a stateful reflector counting:
+ * the loss each way by counters too.  Between two replies that have
+ * them, the packets sent less those the reflector received were lost
+ * on the way out, the replies it sent less those received here on the
+ * way back; summed from the first such reply (dm_told).  A reply that
+ * comes before one sent earlier (reordered) is passed over; counters
+ * that go back (the reflector started again) start the sum's next
+ * part from that reply.
  *
  * A packet not back within the timeout is lost.  Which way it was lost
  * a stateful reflector tells (4.3.2): its Sequence Number counts the
@@ -83,6 +96,11 @@ struct stamp_sender {
 	uint64_t		  gap;		/* lost since that reply */
 	uint16_t		  ee;
 	double			  ee_at;
+	/* The Direct Measurement counters of the last reply that had
+	 * them, and the losses each way they told since the first. */
+	bool			  dm_have;
+	uint32_t		  p_stx, p_rrx, p_rtx, p_srx;
+	int64_t			  dm_fwd, dm_back;
 	struct stamp_sender_stats st;
 };
 
@@ -200,14 +218,15 @@ tlvs_len(const struct stamp_sender *s)
 {
 
 	return ((s->c.tsinfo ? STAMP_TSINFO_LEN : 0) + (s->c.cos ?
-	    STAMP_COS_LEN : 0));
+	    STAMP_COS_LEN : 0) + (s->c.dm ? STAMP_DM_LEN : 0) +
+	    (s->c.location ? STAMP_LOCATION_LEN : 0));
 }
 
 /*
  * The length of a packet of the sender's for one of want octets: the
- * base's at least, and with TLVs (the Timestamp Information TLV, the
- * Class of Service TLV), theirs too, what is left after them 0 or an
- * Extra Padding TLV's 4 octets or more.
+ * base's at least, and with TLVs (Timestamp Information, Class of
+ * Service, Direct Measurement, Location), theirs too, what is left
+ * after them 0 or an Extra Padding TLV's 4 octets or more.
  */
 size_t
 stamp_sender_len(const struct stamp_sender *s, size_t want)
@@ -224,7 +243,9 @@ stamp_sender_len(const struct stamp_sender *s, size_t want)
 /*
  * The next test packet into buf (len octets, STAMP_UNAUTH_LEN or more;
  * what follows the base left as it is, or with TLVs asked for, they,
- * empty but for the Class of Service TLV's DSCP1, and an Extra Padding
+ * in that order, empty but for the Class of Service TLV's DSCP1, the
+ * Direct Measurement TLV's S_TxC and the Location TLV's sub-TLVs
+ * asking for the destination and source addresses, and an Extra Padding
  * TLV over the rest, its octets left as they are: len as
  * stamp_sender_len() says), sent at t1 (the time of day, in the packet)
  * and mono (monotonic seconds).  0; 1 when the window was full and its
@@ -235,7 +256,8 @@ stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
     const struct timespec *t1, double mono, struct stamp_sample *lostp)
 {
 	static const uint8_t	 empty[4];
-	uint8_t			 cos[4];
+	uint8_t			 cos[4], dm[12], loc[44];
+	uint32_t		 stx;
 	struct stamp_test	 t;
 	struct ent		*e;
 	size_t			 off;
@@ -270,6 +292,29 @@ stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
 		cos[0] = (uint8_t)((s->c.dscp & 0x3f) << 2);
 		if (stamp_tlv_put(buf, len, &off, STAMP_TLV_COS, cos,
 		    sizeof(cos)) == -1)
+			return (-1);
+	}
+	if (s->c.dm) {
+		/* Sent in the session, this one too. */
+		memset(dm, 0, sizeof(dm));
+		stx = (uint32_t)(s->st.sent + 1);
+		dm[0] = (uint8_t)(stx >> 24);
+		dm[1] = (uint8_t)(stx >> 16);
+		dm[2] = (uint8_t)(stx >> 8);
+		dm[3] = (uint8_t)stx;
+		if (stamp_tlv_put(buf, len, &off, STAMP_TLV_DM, dm,
+		    sizeof(dm)) == -1)
+			return (-1);
+	}
+	if (s->c.location) {
+		/* The ports, then the destination and the source asked. */
+		memset(loc, 0, sizeof(loc));
+		loc[5] = STAMP_SUB_DSTIP;
+		loc[7] = 16;
+		loc[25] = STAMP_SUB_SRCIP;
+		loc[27] = 16;
+		if (stamp_tlv_put(buf, len, &off, STAMP_TLV_LOCATION, loc,
+		    sizeof(loc)) == -1)
 			return (-1);
 	}
 	if (tlvs_len(s) > 0 && len > off && stamp_tlv_put(buf, len, &off,
@@ -313,6 +358,36 @@ one_way(const struct stamp_sender *s, const struct ent *e,
 		}
 	}
 	out->fwd = out->back = out->rtt / 2;
+}
+
+/*
+ * A reply's Direct Measurement counters: the losses each way since the
+ * last that had them, summed.
+ */
+static void
+dm_count(struct stamp_sender *s, const struct stamp_dm *dm, uint32_t srx)
+{
+	uint32_t	dstx, drrx, drtx, dsrx;
+
+	if (s->dm_have) {
+		dstx = dm->s_tx - s->p_stx;
+		drrx = dm->r_rx - s->p_rrx;
+		drtx = dm->r_tx - s->p_rtx;
+		dsrx = srx - s->p_srx;
+		/* Before the last one: reordered, passed over. */
+		if ((int32_t)dstx < 0)
+			return;
+		/* Counters gone back: from this one again. */
+		if ((int32_t)drrx >= 0 && (int32_t)drtx >= 0) {
+			s->dm_fwd += (int64_t)dstx - (int64_t)drrx;
+			s->dm_back += (int64_t)drtx - (int64_t)dsrx;
+		}
+	}
+	s->dm_have = true;
+	s->p_stx = dm->s_tx;
+	s->p_rrx = dm->r_rx;
+	s->p_rtx = dm->r_tx;
+	s->p_srx = srx;
 }
 
 /*
@@ -375,6 +450,15 @@ stamp_sender_reply(struct stamp_sender *s, const uint8_t *pkt, size_t len,
 		out->has_tsinfo = stamp_tsinfo_find(pkt, len, &out->tsinfo) ==
 		    1;
 		out->has_cos = stamp_cos_find(pkt, len, &out->cos) == 1;
+		out->has_loc = stamp_location_find(pkt, len, &out->loc) == 1;
+		out->s_rx = (uint32_t)s->st.received;
+		if ((out->has_dm = stamp_dm_find(pkt, len, &out->dm) == 1))
+			dm_count(s, &out->dm, out->s_rx);
+	} else {
+		struct stamp_dm	dm;
+
+		if (stamp_dm_find(pkt, len, &dm) == 1)
+			dm_count(s, &dm, (uint32_t)s->st.received);
 	}
 	advance(s);
 	return (1);
@@ -417,4 +501,7 @@ stamp_sender_stats(const struct stamp_sender *s, struct stamp_sender_stats *st)
 {
 
 	*st = s->st;
+	st->dm_told = s->dm_have;
+	st->dm_fwd_lost = s->dm_fwd > 0 ? (uint64_t)s->dm_fwd : 0;
+	st->dm_back_lost = s->dm_back > 0 ? (uint64_t)s->dm_back : 0;
 }
