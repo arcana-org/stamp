@@ -12,7 +12,9 @@
  * within the wait; at the end the loss, each way when the reflector is
  * stateful, and the delay each way, one way when both clocks allow,
  * else half the round trip.  -T asks for the reflector's Timestamp
- * Information TLV; -C says this clock's synchronisation.  A TWAMP
+ * Information TLV; -D sends the packets with a DSCP and asks, by the
+ * Class of Service TLV, for the replies to come back with it; -C says
+ * this clock's synchronisation.  A TWAMP
  * Light sender's packet by -l (14 octets and its padding).  In the FIB
  * the process is in: setfib(1).
  */
@@ -47,10 +49,10 @@ usage(void)
 {
 
 	fprintf(stderr, "usage: stamp [-T] [-C source[:error]] [-c count] "
-	    "[-i interval] [-l length]\n"
-	    "             [-m mode] [-p port] [-q seq] [-S sport] [-s ssid] "
-	    "[-t ttl]\n"
-	    "             [-W wait] host\n");
+	    "[-D dscp[/reply]]\n"
+	    "             [-i interval] [-l length] [-m mode] [-p port] "
+	    "[-q seq]\n"
+	    "             [-S sport] [-s ssid] [-t ttl] [-W wait] host\n");
 	exit(1);
 }
 
@@ -72,6 +74,27 @@ ok(bool b)
 {
 
 	return (b ? "ok" : "bad");
+}
+
+/* The Class of Service TLV as the reflector filled it, and the DSCP
+ * the reply came with: "cos=DSCP1/DSCP2/ECN/RP rdscp=D", "-" for what
+ * was not said. */
+static const char *
+cos_say(const struct stamp_sample *sm, const struct stamp_rxinfo *ri)
+{
+	static char	buf[64];
+
+	if (sm->has_cos)
+		(void)snprintf(buf, sizeof(buf), " cos=%u/%u/%u/%u",
+		    sm->cos.dscp1, sm->cos.dscp2, sm->cos.ecn, sm->cos.rp);
+	else
+		(void)snprintf(buf, sizeof(buf), " cos=-");
+	if (ri->tos >= 0)
+		(void)snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
+		    " rdscp=%d", ri->tos >> 2);
+	else
+		(void)strlcat(buf, " rdscp=-", sizeof(buf));
+	return (buf);
 }
 
 /* The reflector's Timestamp Information, "-" with none. */
@@ -112,7 +135,7 @@ main(int argc, char *argv[])
 	struct timespec		  t1, ts;
 	struct kevent		  kev;
 	uint8_t			  pkt[STAMP_PKT_MAX], in[STAMP_PKT_MAX];
-	char			  from[64];
+	char			  from[64], *slash;
 	double			  interval = 1, wait = 2, start, at, until, now;
 	double			  sum = 0, min = 0, max = 0, left, ex;
 	double			  fsum = 0, bsum = 0;
@@ -120,10 +143,10 @@ main(int argc, char *argv[])
 	size_t			  len = STAMP_UNAUTH_LEN, plen, pad, i;
 	unsigned long		  count = 1, k = 0, measured = 0;
 	int			  ch, fd, kq, ttl = -1, port = STAMP_PORT;
-	int			  sport = 0, rc;
+	int			  sport = 0, rc, dscp = -1, v;
 
 	memset(&sc, 0, sizeof(sc));
-	while ((ch = getopt(argc, argv, "C:c:i:l:m:p:q:S:s:Tt:W:")) != -1)
+	while ((ch = getopt(argc, argv, "C:c:D:i:l:m:p:q:S:s:Tt:W:")) != -1)
 		switch (ch) {
 		case 'C':
 			if (stamp_clock_set(optarg) == -1)
@@ -135,6 +158,15 @@ main(int argc, char *argv[])
 			break;
 		case 'c':
 			count = (unsigned long)num("c", optarg, 1, 1000000);
+			break;
+		case 'D':
+			/* dscp[/reply]: the packets', the replies' asked. */
+			if ((slash = strchr(optarg, '/')) != NULL)
+				*slash++ = '\0';
+			dscp = (int)num("D", optarg, 0, 63);
+			sc.cos = true;
+			sc.dscp = (uint8_t)(slash != NULL ? num("D", slash, 0,
+			    63) : dscp);
 			break;
 		case 'i':
 			interval = num("i", optarg, 0, 3600);
@@ -185,6 +217,11 @@ main(int argc, char *argv[])
 	    IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) : setsockopt(fd,
 	    IPPROTO_IPV6, IPV6_UNICAST_HOPS, &ttl, sizeof(ttl))) == -1)
 		err(1, "the TTL");
+	v = dscp << 2;
+	if (dscp != -1 && (to.ss_family == AF_INET ? setsockopt(fd,
+	    IPPROTO_IP, IP_TOS, &v, sizeof(v)) : setsockopt(fd,
+	    IPPROTO_IPV6, IPV6_TCLASS, &v, sizeof(v))) == -1)
+		err(1, "the DSCP");
 	if ((kq = kqueue()) == -1)
 		err(1, "kqueue");
 	EV_SET(&kev, fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
@@ -196,17 +233,17 @@ main(int argc, char *argv[])
 		err(1, "the sender");
 	/*
 	 * What follows the base: a pattern, to see it come back; with -T
-	 * the TLV first, the pattern in an Extra Padding TLV after it,
-	 * the packet as long as they need.  Without, the base whatever
-	 * the length (a short one to see it refused).
+	 * or -D the TLVs first, the pattern in an Extra Padding TLV after
+	 * them, the packet as long as they need.  Without, the base
+	 * whatever the length (a short one to see it refused).
 	 */
 	for (i = STAMP_UNAUTH_LEN; i < sizeof(pkt); i++)
 		pkt[i] = (uint8_t)i;
 	pad = STAMP_UNAUTH_LEN;
-	if (sc.tsinfo) {
+	if (sc.tsinfo || sc.cos) {
 		len = stamp_sender_len(snd, len);
 		plen = len;
-		pad += STAMP_TSINFO_LEN;
+		pad = stamp_sender_len(snd, 0);
 	} else
 		plen = sizeof(pkt);
 
@@ -260,7 +297,7 @@ main(int argc, char *argv[])
 			printf("len=%zd from=%s seq=%u ssid=%u sseq=%u ttl=%u "
 			    "rttl=%d echo=%s order=%s clock=%s serr=%s mbz=%s "
 			    "pad=%s rtt=%.3f fwd=%.3f back=%.3f owd=%s err=%.6f "
-			    "ti=%s\n", n,
+			    "ti=%s%s\n", n,
 			    stamp_sa_ntop((struct sockaddr *)&ri.peer, from,
 			    sizeof(from)), sm.r.seq, sm.r.ssid, sm.r.sseq,
 			    sm.r.sttl, ri.ttl, ok(memcmp(in + 28,
@@ -272,7 +309,8 @@ main(int argc, char *argv[])
 			    ok((size_t)n == len && memcmp(in + pad, pkt + pad,
 			    (size_t)n - pad) == 0), sm.rtt * 1e3, sm.fwd * 1e3,
 			    sm.back * 1e3, sm.owd ? "measured" : "estimated",
-			    sm.err * 1e3, tsinfo(&sm));
+			    sm.err * 1e3, tsinfo(&sm), sc.cos ? cos_say(&sm, &ri) :
+			    "");
 			fsum += sm.fwd;
 			bsum += sm.back;
 			if (sm.owd)

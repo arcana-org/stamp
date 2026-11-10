@@ -14,6 +14,7 @@
 .Nm stamp_tlv_next ,
 .Nm stamp_tlv_put ,
 .Nm stamp_tsinfo_find ,
+.Nm stamp_cos_find ,
 .Nm stamp_ntp_put ,
 .Nm stamp_ntp_get ,
 .Nm stamp_ptp_put ,
@@ -32,6 +33,7 @@
 .Nm stamp_refl_setconf ,
 .Nm stamp_refl_free ,
 .Nm stamp_refl_reply ,
+.Nm stamp_refl_reply_tos ,
 .Nm stamp_refl_send_time ,
 .Nm stamp_refl_expire ,
 .Nm stamp_refl_stats ,
@@ -70,6 +72,8 @@ STAMP Library
 .Fn stamp_tlv_put "uint8_t *pkt" "size_t len" "size_t *off" "uint8_t type" "const void *value" "uint16_t vlen"
 .Ft int
 .Fn stamp_tsinfo_find "const uint8_t *pkt" "size_t len" "struct stamp_tsinfo *ti"
+.Ft int
+.Fn stamp_cos_find "const uint8_t *pkt" "size_t len" "struct stamp_cos *cos"
 .Ft void
 .Fn stamp_ntp_put "uint8_t *p" "const struct timespec *ts"
 .Ft void
@@ -106,6 +110,8 @@ STAMP Library
 .Fn stamp_refl_free "struct stamp_refl *r"
 .Ft ssize_t
 .Fn stamp_refl_reply "struct stamp_refl *r" "const struct stamp_rx *rx" "uint8_t *out" "size_t outlen" "enum stamp_drop *why"
+.Ft int
+.Fn stamp_refl_reply_tos "const struct stamp_refl *r"
 .Ft void
 .Fn stamp_refl_send_time "uint8_t *out" "const struct timespec *t3"
 .Ft void
@@ -139,7 +145,7 @@ STAMP Library
 .Ft ssize_t
 .Fn stamp_recv "int fd" "uint8_t *buf" "size_t len" "struct stamp_rxinfo *ri"
 .Ft int
-.Fn stamp_send "int fd" "const uint8_t *buf" "size_t len" "const struct sockaddr *to" "const struct sockaddr *from" "unsigned ifindex"
+.Fn stamp_send "int fd" "const uint8_t *buf" "size_t len" "const struct sockaddr *to" "const struct sockaddr *from" "unsigned ifindex" "int tos"
 .Ft int
 .Fn stamp_sockaddr "const char *host" "uint16_t port" "struct sockaddr_storage *ss"
 .Ft uint16_t
@@ -151,7 +157,7 @@ The
 .Nm
 library implements the Simple Two-way Active Measurement Protocol
 (STAMP, RFC 8762) with the Session-Sender Identifier and the
-Timestamp Information TLV of RFC 8972:
+Timestamp Information and Class of Service TLVs of RFC 8972:
 its packets in unauthenticated mode, its timestamps and error
 estimate, the clock's synchronisation, the Session-Reflector's core,
 the Session-Sender's core and the UDP socket of either end.
@@ -159,8 +165,8 @@ It has no other dependency than the C library.
 The authenticated mode
 .Pq Dv STAMP_AUTH , No 112 octets and an HMAC
 is not implemented yet; of the TLVs that follow the base packet, the
-Timestamp Information TLV is filled by the reflector and read by the
-sender, the others carried as they are.
+Timestamp Information and Class of Service TLVs are filled by the
+reflector and read by the sender, the others marked unrecognised.
 .Ss Packets
 .Fn stamp_test_encode
 writes a Session-Sender test packet
@@ -217,7 +223,23 @@ and T3
 the methods
 .Dv STAMP_TSM_HW , STAMP_TSM_SW , STAMP_TSM_CP .
 It returns 1, 0 when there is none or the reflector marked it
-unrecognised, \-1 when the TLVs run past the packet.
+unrecognised or malformed, \-1 when the TLVs run past the packet.
+.Fn stamp_cos_find
+reads the Class of Service TLV
+.Pq Dv STAMP_TLV_COS , No RFC 8972 section 4.4
+into
+.Vt struct stamp_cos ,
+the same way:
+.Va dscp1 ,
+the DSCP the sender asked the reply to carry;
+.Va dscp2
+and
+.Va ecn ,
+those the request reached the reflector with; and
+.Va rp ,
+1 when the reflector would not set
+.Va dscp1 ,
+its reply carrying the request's DSCP instead.
 .Ss Timestamps and the error estimate
 .Fn stamp_ntp_put
 and
@@ -324,6 +346,12 @@ from port 0.
 .It Va ts_out
 How the caller takes T3, for the Timestamp Information TLV; 0 for
 .Dv STAMP_TSM_SW .
+.It Va dscp_deny
+The DSCPs a Class of Service TLV may not ask the reply to carry, bit
+.Ar n
+for DSCP
+.Ar n :
+their replies carry the DSCP the request came with, the TLV's RP 1.
 .El
 .Pp
 .Fn stamp_refl_setconf
@@ -344,9 +372,21 @@ for T2, 0 for
 .Dv STAMP_TSM_SW ,
 and
 .Va ts_out
-for T3) and any other but Extra Padding marked unrecognised
+for T3), the Class of Service TLV too (DSCP2 and ECN from
+.Va tos ,
+the TOS or traffic class octet the request came with, \-1 not known),
+one of those too short or, the Class of Service TLV, not of 4 octets
+marked malformed
+.Pq Dv STAMP_TLV_M ,
+and any other but Extra Padding marked unrecognised
 .Pq Dv STAMP_TLV_U ;
 anything else is padding, copied as it is.
+.Fn stamp_refl_reply_tos
+is the TOS octet the reply just made is to be sent with: the Class of
+Service TLV's DSCP1, or, refused by
+.Va dscp_deny ,
+the request's DSCP; \-1 (the socket's own) when the request had no
+such TLV, or its TOS is not known.
 A packet shorter than the base, from port 0 or the reflector's own, or
 over a rate limit is not answered: \-1, why in
 .Fa *why
@@ -385,6 +425,14 @@ Packets in flight at most (0: 256).
 .It Va tsinfo
 The packets carry the Timestamp Information TLV for the reflector to
 fill.
+.It Va cos , dscp
+The packets carry the Class of Service TLV, asking the reflector to
+send its replies with DSCP
+.Va dscp ;
+the caller sends them with the DSCP it wants
+.Pq Dv IP_TOS , IPV6_TCLASS
+and reads the DSCP the replies came with
+.Pq Fn stamp_recv .
 .It Va owd_frac
 The delay each way is said one way when the two error estimates
 together are no more than this part of half the round trip
@@ -405,14 +453,17 @@ it returns 0, or 1 when the window was full and its oldest packet
 given up, lost, that one's sample in
 .Fa *lostp .
 With
-.Va tsinfo ,
-the Timestamp Information TLV follows the base, empty, and an Extra
-Padding TLV the rest,
+.Va tsinfo
+or
+.Va cos ,
+the Timestamp Information TLV and the Class of Service TLV follow the
+base, in that order, empty but for DSCP1, and an Extra Padding TLV
+the rest,
 .Fa len
 as
 .Fn stamp_sender_len
-says: the base's 44 octets at least, 52 with the TLV, and with more
-after it 4 octets or more
+says: the base's 44 octets at least, 8 more for each TLV, and with
+more after them 4 octets or more
 .Pq else Er EMSGSIZE ;
 .Fn stamp_sender_len
 is that length for one of
@@ -453,7 +504,11 @@ round trip each, an estimate;
 .Va has_tsinfo
 and
 .Va tsinfo
-the reflector's Timestamp Information TLV; and
+the reflector's Timestamp Information TLV;
+.Va has_cos
+and
+.Va cos
+its Class of Service TLV; and
 .Va r
 the reply.
 .Fn stamp_sender_expire
@@ -499,7 +554,9 @@ in the process's FIB
 .Pq Xr setfib 2 ;
 the time a packet comes is the kernel's
 .Pq Dv SO_TIMESTAMP , SO_TS_REALTIME ,
-the TTL or hop limit and the address it came to said.
+the TTL or hop limit, the TOS or traffic class
+.Pq Dv IP_RECVTOS , IPV6_RECVTCLASS
+and the address it came to said.
 .Dv STAMP_SOCK_REFLECTOR
 in
 .Fa flags
@@ -523,12 +580,16 @@ the monotonic time, each the kernel's when it said, the other then
 that instant on its clock, else the clock's;
 .Va hwts
 when the kernel says the hardware took it
-.Pq Dv SCM_TIME_INFO .
+.Pq Dv SCM_TIME_INFO ;
+.Va tos
+the TOS or traffic class octet it came with, \-1 not said.
 .Fn stamp_send
 sends from the address
 .Fa from
 (the one a packet came to), the routes' own when that is not of an
-interface of the socket's FIB.
+interface of the socket's FIB, with the TOS or traffic class octet
+.Fa tos
+.Pq Dv IP_TOS , IPV6_TCLASS ; No \-1 the socket's .
 .Fn stamp_sockaddr
 resolves a host and port;
 .Fn stamp_sa_port

@@ -505,6 +505,62 @@ owd_cleanup()
 	stop
 }
 
+atf_test_case cos cleanup
+cos_head()
+{
+	atf_set "descr" "The Class of Service TLV: the DSCP each request" \
+	    "reached stampd with (DSCP2), the replies with the DSCP asked" \
+	    "for (DSCP1, read by IP_RECVTOS and IPV6_RECVTCLASS), or, that" \
+	    "DSCP refused (-D, dscp-refuse), with the request's, RP 1"
+}
+cos_body()
+{
+	P=$(port)
+	start -p $P -r 0
+	# Sent with 10, the replies asked for with 46: 46 back.
+	atf_check -o match:'^len=52 .* pad=ok .* ti=- cos=46/10/0/0 rdscp=46$' \
+	    "$S" -D 10/46 -p $P 127.0.0.1
+	atf_check -o match:'^len=100 .* pad=ok .* ti=[a-z]+/sw,[a-z]+/sw cos=0/34/0/0 rdscp=0$' \
+	    "$S" -T -D 34/0 -l 100 -p $P 127.0.0.1
+	if has_inet6; then
+		atf_check -o match:'^len=52 from=::1 .* cos=46/10/0/0 rdscp=46$' \
+		    "$S" -D 10/46 -p $P ::1
+	fi
+	# Without the TLV: the socket's own, 0.
+	atf_check -o match:'^len=44 .* ti=-$' "$S" -p $P 127.0.0.1
+	stop
+	# 46 refused: the reply with the request's 10, RP 1; 26 not.
+	start -p $P -r 0 -D 46,48
+	atf_check -o match:'started: .* 2 DSCPs refused a reply' cat d.out
+	atf_check -o match:' cos=46/10/0/1 rdscp=10$' \
+	    "$S" -D 10/46 -p $P 127.0.0.1
+	atf_check -o match:' cos=26/10/0/0 rdscp=26$' \
+	    "$S" -D 10/26 -p $P 127.0.0.1
+	if has_inet6; then
+		atf_check -o match:' cos=46/12/0/1 rdscp=12$' \
+		    "$S" -D 12/46 -p $P ::1
+	fi
+	stop
+	# From the file; the command line over it.
+	echo 'dscp-refuse all' > c.conf
+	start -p $P -r 0 -f "$(pwd)/c.conf"
+	atf_check -o match:' cos=26/10/0/1 rdscp=10$' \
+	    "$S" -D 10/26 -p $P 127.0.0.1
+	stop
+	start -p $P -r 0 -f "$(pwd)/c.conf" -D none
+	atf_check -o match:' cos=26/10/0/0 rdscp=26$' \
+	    "$S" -D 10/26 -p $P 127.0.0.1
+	stop
+	echo 'dscp-refuse 64' > c.conf
+	programs
+	atf_check -s exit:1 -e match:'dscp-refuse' "$D" -d $U -p $P \
+	    -f "$(pwd)/c.conf"
+}
+cos_cleanup()
+{
+	stop
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case stateless
@@ -516,4 +572,5 @@ atf_init_test_cases()
 	atf_add_test_case privileges
 	atf_add_test_case loss
 	atf_add_test_case owd
+	atf_add_test_case cos
 }

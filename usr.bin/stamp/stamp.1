@@ -14,6 +14,7 @@
 .Op Fl T
 .Op Fl C Ar source Ns Op : Ns Ar error
 .Op Fl c Ar count
+.Op Fl D Ar dscp Ns Op / Ns Ar reply
 .Op Fl i Ar interval
 .Op Fl l Ar length
 .Op Fl m Cm stateless | stateful
@@ -61,6 +62,16 @@ does not know is synchronised, as
 .Fl C .
 .It Fl c Ar count
 Packets to send; default 1.
+.It Fl D Ar dscp Ns Op / Ns Ar reply
+Send the packets with DSCP
+.Ar dscp
+and ask, by the Class of Service TLV (RFC 8972 section 4.4), for the
+replies to come back with
+.Ar reply
+(default the same); the TLV follows the base, after the Timestamp
+Information TLV with
+.Fl T ,
+8 octets more.
 .It Fl i Ar interval
 Seconds from one packet to the next; default 1.
 .It Fl l Ar length
@@ -138,6 +149,16 @@ methods
 .Cm hw , sw , cp ) ;
 .Ql -
 without.
+.It Cm cos , rdscp
+With
+.Fl D :
+the Class of Service TLV as the reflector filled it, as
+.Ql DSCP1/DSCP2/ECN/RP :
+the DSCP asked for the reply, the DSCP and ECN the packet reached the
+reflector with, and RP 1 when the reflector would not send the reply
+with DSCP1
+.Pq Ql -
+when it did not fill it); and the DSCP the reply came back with.
 .El
 .Pp
 With a count above 1, a last line says the packets
@@ -174,6 +195,7 @@ exits 0 when a reply came, 2 when none did, and 1 on an error.
 $ stamp -c 100 -i 0.1 192.0.2.1
 $ setfib 1 stamp -s 7 -l 200 2001:db8::1
 $ stamp -T -C ptp:0.000001 -c 10 192.0.2.1
+$ stamp -D 46 -c 10 192.0.2.1
 .Ed
 .Sh SEE ALSO
 .Xr setfib 1 ,

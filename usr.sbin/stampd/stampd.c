@@ -55,6 +55,7 @@
 #define	SET_MODE		0x01
 #define	SET_RATE		0x02
 #define	SET_TOTAL		0x04
+#define	SET_DSCP		0x08
 
 static struct stamp_refl_conf	 cl;	/* the command line's */
 static int			 cl_set;
@@ -70,10 +71,10 @@ static void
 usage(void)
 {
 
-	fprintf(stderr, "usage: stampd [-d] [-C source[:error]] [-f file]"
-	    " [-m stateless | stateful]\n"
-	    "              [-P pidfile] [-p port] [-r rate[/burst]] [-R rate]"
-	    " [-u user]\n");
+	fprintf(stderr, "usage: stampd [-d] [-C source[:error]] [-D dscps] "
+	    "[-f file]\n"
+	    "              [-m stateless | stateful] [-P pidfile] [-p port]\n"
+	    "              [-r rate[/burst]] [-R rate] [-u user]\n");
 	exit(1);
 }
 
@@ -124,6 +125,36 @@ parse_mode(const char *s, struct stamp_refl_conf *c)
 		c->stateful = false;
 	else
 		return (false);
+	return (true);
+}
+
+/* The DSCPs a Class of Service TLV may not ask for: "all", "none", or
+ * a list of them, 0 to 63, by commas; false when it is not one. */
+static bool
+parse_dscps(const char *s, struct stamp_refl_conf *c)
+{
+	char		 buf[256], *p, *w;
+	const char	*e;
+	uint64_t	 m = 0;
+	long long	 d;
+
+	if (strcmp(s, "all") == 0) {
+		c->dscp_deny = ~(uint64_t)0;
+		return (true);
+	}
+	if (strcmp(s, "none") == 0) {
+		c->dscp_deny = 0;
+		return (true);
+	}
+	if (strlcpy(buf, s, sizeof(buf)) >= sizeof(buf))
+		return (false);
+	for (p = buf; (w = strsep(&p, ",")) != NULL;) {
+		d = strtonum(w, 0, 63, &e);
+		if (e != NULL)
+			return (false);
+		m |= (uint64_t)1 << d;
+	}
+	c->dscp_deny = m;
 	return (true);
 }
 
@@ -185,10 +216,12 @@ conf_read(struct stamp_refl_conf *c, char *why, size_t whylen)
 		if (val == NULL || *val == '\0' || (p != NULL && *p != '\0') ||
 		    !((strcmp(key, "mode") == 0 && parse_mode(val, c)) ||
 		    (strcmp(key, "rate") == 0 && parse_rate(val, c)) ||
-		    (strcmp(key, "rate-total") == 0 && parse_total(val, c)))) {
+		    (strcmp(key, "rate-total") == 0 && parse_total(val, c)) ||
+		    (strcmp(key, "dscp-refuse") == 0 && parse_dscps(val, c)))) {
 			(void)snprintf(why, whylen, "%s, line %d: \"%s\" is not "
-			    "mode stateless|stateful, rate rate[/burst] or "
-			    "rate-total rate", conf_name, n, key);
+			    "mode stateless|stateful, rate rate[/burst], "
+			    "rate-total rate or dscp-refuse all|none|d,d,...",
+			    conf_name, n, key);
 			error = -1;
 		}
 	}
@@ -205,6 +238,8 @@ cmdline:
 	}
 	if (cl_set & SET_TOTAL)
 		c->rate_total = cl.rate_total;
+	if (cl_set & SET_DSCP)
+		c->dscp_deny = cl.dscp_deny;
 	return (0);
 }
 
@@ -224,8 +259,9 @@ conf_say(const struct stamp_refl_conf *c, const char *what)
 		    c->rate_total);
 	else
 		(void)snprintf(total, sizeof(total), "no limit in all");
-	syslog(LOG_INFO, "%s: %s, %s, %s", what, c->stateful ? "stateful" :
-	    "stateless", rate, total);
+	syslog(LOG_INFO, "%s: %s, %s, %s, %d DSCPs refused a reply", what,
+	    c->stateful ? "stateful" : "stateless", rate, total,
+	    __builtin_popcountll(c->dscp_deny));
 }
 
 /* The packets waiting on fd, each answered or dropped. */
@@ -254,6 +290,7 @@ reflect(int fd)
 		rx.ttl = ri.ttl;
 		rx.t2 = ri.t;
 		rx.ts_in = ri.hwts ? STAMP_TSM_HW : STAMP_TSM_SW;
+		rx.tos = ri.tos;
 		rx.tag = fib;
 		if ((n = stamp_refl_reply(refl, &rx, out, sizeof(out), NULL)) <
 		    0)
@@ -261,7 +298,7 @@ reflect(int fd)
 		clock_gettime(CLOCK_REALTIME, &t3);
 		stamp_refl_send_time(out, &t3);
 		if (stamp_send(fd, out, (size_t)n, rx.peer, rx.local,
-		    ri.ifindex) == -1)
+		    ri.ifindex, stamp_refl_reply_tos(refl)) == -1)
 			syslog(LOG_DEBUG, "a reply to %s: %m",
 			    stamp_sa_ntop(rx.peer, a, sizeof(a)));
 	}
@@ -294,12 +331,18 @@ main(int argc, char *argv[])
 	int		 ch, kq, fds[2], nfds, i, n, port = STAMP_PORT, all;
 	bool		 debug = false;
 
-	while ((ch = getopt(argc, argv, "C:df:m:P:p:R:r:u:")) != -1)
+	while ((ch = getopt(argc, argv, "C:D:df:m:P:p:R:r:u:")) != -1)
 		switch (ch) {
 		case 'C':
 			if (stamp_clock_set(optarg) == -1)
 				errx(1, "-C %s: ntp, ptp, ssu, gnss or local, "
 				    "and :error in seconds", optarg);
+			break;
+		case 'D':
+			if (!parse_dscps(optarg, &cl))
+				errx(1, "-D %s: all, none or DSCPs 0 to 63 by "
+				    "commas", optarg);
+			cl_set |= SET_DSCP;
 			break;
 		case 'd':
 			debug = true;

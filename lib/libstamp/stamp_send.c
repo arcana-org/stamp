@@ -24,6 +24,11 @@
  * the round trip each way, flagged an estimate.  With tsinfo the
  * packets carry the Timestamp Information TLV (RFC 8972 4.3), which
  * the reflector fills: its clock's source, how it took T2 and T3.
+ * With cos, the Class of Service TLV (4.4) asks the reflector to send
+ * its reply with the DSCP dscp (the caller sends its packets with the
+ * DSCP it wants, on its socket) and tells the DSCP and ECN the packet
+ * reached the reflector with; the DSCP the reply came back with is the
+ * caller's to read (stamp_recv()).
  *
  * A packet not back within the timeout is lost.  Which way it was lost
  * a stateful reflector tells (4.3.2): its Sequence Number counts the
@@ -188,39 +193,49 @@ lose(struct stamp_sender *s, uint32_t seq, struct stamp_sample *out)
 	advance(s);
 }
 
+/* The octets of the TLVs the sender's packets carry, Extra Padding's
+ * aside. */
+static size_t
+tlvs_len(const struct stamp_sender *s)
+{
+
+	return ((s->c.tsinfo ? STAMP_TSINFO_LEN : 0) + (s->c.cos ?
+	    STAMP_COS_LEN : 0));
+}
+
 /*
  * The length of a packet of the sender's for one of want octets: the
- * base's at least, and with the Timestamp Information TLV, its too,
- * what is left after it 0 or an Extra Padding TLV's 4 octets or more.
+ * base's at least, and with TLVs (the Timestamp Information TLV, the
+ * Class of Service TLV), theirs too, what is left after them 0 or an
+ * Extra Padding TLV's 4 octets or more.
  */
 size_t
 stamp_sender_len(const struct stamp_sender *s, size_t want)
 {
-	size_t	min = STAMP_UNAUTH_LEN;
+	size_t	min = STAMP_UNAUTH_LEN + tlvs_len(s);
 
-	if (s->c.tsinfo)
-		min += STAMP_TSINFO_LEN;
 	if (want < min)
 		return (min);
-	if (s->c.tsinfo && want - min > 0 && want - min < STAMP_TLV_HDR)
+	if (tlvs_len(s) > 0 && want - min > 0 && want - min < STAMP_TLV_HDR)
 		return (min + STAMP_TLV_HDR);
 	return (want);
 }
 
 /*
  * The next test packet into buf (len octets, STAMP_UNAUTH_LEN or more;
- * what follows the base left as it is, or with tsinfo the Timestamp
- * Information TLV, empty, and an Extra Padding TLV over the rest, its
- * octets left as they are: len as stamp_sender_len() says), sent at t1
- * (the time of day, in the packet) and mono (monotonic seconds).  0; 1
- * when the window was full and its oldest packet given up, lost, its
- * sample in *lostp; -1 with errno.
+ * what follows the base left as it is, or with TLVs asked for, they,
+ * empty but for the Class of Service TLV's DSCP1, and an Extra Padding
+ * TLV over the rest, its octets left as they are: len as
+ * stamp_sender_len() says), sent at t1 (the time of day, in the packet)
+ * and mono (monotonic seconds).  0; 1 when the window was full and its
+ * oldest packet given up, lost, its sample in *lostp; -1 with errno.
  */
 int
 stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
     const struct timespec *t1, double mono, struct stamp_sample *lostp)
 {
 	static const uint8_t	 empty[4];
+	uint8_t			 cos[4];
 	struct stamp_test	 t;
 	struct ent		*e;
 	size_t			 off;
@@ -246,15 +261,20 @@ stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
 	t.ssid = s->c.ssid;
 	if (stamp_test_encode(buf, len, &t) == -1)
 		return (-1);
-	if (s->c.tsinfo) {
-		off = STAMP_UNAUTH_LEN;
-		if (stamp_tlv_put(buf, len, &off, STAMP_TLV_TSINFO, empty,
-		    sizeof(empty)) == -1)
-			return (-1);
-		if (len > off && stamp_tlv_put(buf, len, &off, STAMP_TLV_PAD,
-		    NULL, (uint16_t)(len - off - STAMP_TLV_HDR)) == -1)
+	off = STAMP_UNAUTH_LEN;
+	if (s->c.tsinfo && stamp_tlv_put(buf, len, &off, STAMP_TLV_TSINFO,
+	    empty, sizeof(empty)) == -1)
+		return (-1);
+	if (s->c.cos) {
+		memset(cos, 0, sizeof(cos));
+		cos[0] = (uint8_t)((s->c.dscp & 0x3f) << 2);
+		if (stamp_tlv_put(buf, len, &off, STAMP_TLV_COS, cos,
+		    sizeof(cos)) == -1)
 			return (-1);
 	}
+	if (tlvs_len(s) > 0 && len > off && stamp_tlv_put(buf, len, &off,
+	    STAMP_TLV_PAD, NULL, (uint16_t)(len - off - STAMP_TLV_HDR)) == -1)
+		return (-1);
 	e = &s->ring[s->next & s->mask];
 	e->st = E_PENDING;
 	e->mono = mono;
@@ -354,6 +374,7 @@ stamp_sender_reply(struct stamp_sender *s, const uint8_t *pkt, size_t len,
 		one_way(s, e, &r, t4, out);
 		out->has_tsinfo = stamp_tsinfo_find(pkt, len, &out->tsinfo) ==
 		    1;
+		out->has_cos = stamp_cos_find(pkt, len, &out->cos) == 1;
 	}
 	advance(s);
 	return (1);

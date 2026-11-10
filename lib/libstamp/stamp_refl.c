@@ -22,8 +22,8 @@
  * A reflector answers whoever writes a source address, so it is no
  * amplifier and no firehose.  Only a packet of STAMP_UNAUTH_LEN octets
  * or more is answered, the reply exactly as long, what follows the
- * base copied (padding, TLVs; the Timestamp Information TLV filled,
- * those not known marked so).  Not one from port 0 nor from the
+ * base copied (padding, TLVs; the Timestamp Information and Class of
+ * Service TLVs filled, those not known marked so).  Not one from port 0 nor from the
  * reflector's own port (two reflectors made to answer each other
  * forever by one forged packet).  And no more replies to one source
  * address than its token bucket allows, nor to all of them together
@@ -78,6 +78,7 @@ struct stamp_refl {
 	struct stamp_clock	 clk;
 	double			 clk_at;
 	struct stamp_refl_stats	 st;
+	int			 reply_tos;	/* the last reply's; -1 */
 };
 
 double
@@ -351,6 +352,7 @@ stamp_refl_new(const struct stamp_refl_conf *c)
 	if ((r = calloc(1, sizeof(*r))) == NULL)
 		return (NULL);
 	r->key = arc4random();
+	r->reply_tos = -1;
 	if (stamp_refl_setconf(r, c) == -1) {
 		free(r);
 		return (NULL);
@@ -377,21 +379,51 @@ stamp_refl_stats(const struct stamp_refl *r, struct stamp_refl_stats *st)
 }
 
 /*
- * The TLVs of a reply of len octets, copied from the request (RFC 8972
- * 4): the Timestamp Information TLV filled (the clock's source, how T2
- * and T3 are taken), any other but Extra Padding marked unrecognised
- * (U).  What follows the base is TLVs only when it is TLVs to its end,
- * none of type 0: anything else is a sender's padding (a TWAMP Light
- * sender's zeros, a pattern), copied as it is.
+ * The Class of Service TLV's value (RFC 8972 4.4) at v, of a request
+ * that came with rx->tos: DSCP2 and ECN what it came with, and the
+ * reply to carry DSCP1 unless the configuration refuses it, else the
+ * request's DSCP, RP 1.
  */
 static void
-tlvs_reflect(uint8_t *out, size_t len, uint8_t sync, uint8_t ts_in,
-    uint8_t ts_out)
+cos_reflect(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *v)
+{
+	uint8_t	dscp1, dscp2, ecn, rp;
+
+	dscp1 = v[0] >> 2;
+	dscp2 = rx->tos >= 0 ? (uint8_t)(rx->tos >> 2) : 0;
+	ecn = rx->tos >= 0 ? (uint8_t)(rx->tos & 0x03) : 0;
+	if (r->c.dscp_deny & ((uint64_t)1 << dscp1)) {
+		rp = 1;
+		r->reply_tos = rx->tos >= 0 ? rx->tos & 0xfc : -1;
+	} else {
+		rp = 0;
+		r->reply_tos = dscp1 << 2;
+	}
+	v[0] = (uint8_t)(dscp1 << 2 | dscp2 >> 4);
+	v[1] = (uint8_t)((dscp2 & 0x0f) << 4 | ecn << 2 | rp);
+	v[2] = v[3] = 0;
+}
+
+/*
+ * The TLVs of a reply of len octets, copied from the request (RFC 8972
+ * 4): the Timestamp Information TLV filled (the clock's source, how T2
+ * and T3 are taken), the Class of Service TLV too (cos_reflect()), one
+ * of either too short marked malformed (M), any other but Extra Padding
+ * marked unrecognised (U).  What follows the base is TLVs only when it
+ * is TLVs to its end, none of type 0: anything else is a sender's
+ * padding (a TWAMP Light sender's zeros, a pattern), copied as it is.
+ */
+static void
+tlvs_reflect(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *out,
+    size_t len)
 {
 	struct stamp_tlv	v;
 	size_t			off, at;
+	uint8_t			sync = r->clk.sync, ts_in, ts_out;
 	int			rc;
 
+	ts_in = rx->ts_in != 0 ? rx->ts_in : STAMP_TSM_SW;
+	ts_out = r->c.ts_out != 0 ? r->c.ts_out : STAMP_TSM_SW;
 	off = STAMP_UNAUTH_LEN;
 	while ((rc = stamp_tlv_next(out, len, &off, &v)) == 1)
 		if (v.type == 0)
@@ -403,14 +435,40 @@ tlvs_reflect(uint8_t *out, size_t len, uint8_t sync, uint8_t ts_in,
 		at = off;
 		if (stamp_tlv_next(out, len, &off, &v) != 1)
 			break;
-		if (v.type == STAMP_TLV_TSINFO && v.len >= 4) {
+		switch (v.type) {
+		case STAMP_TLV_PAD:
+			break;
+		case STAMP_TLV_TSINFO:
+			if (v.len < 4) {
+				out[at] |= STAMP_TLV_U;
+				break;
+			}
 			out[at + 4] = sync;
 			out[at + 5] = ts_in;
 			out[at + 6] = sync;
 			out[at + 7] = ts_out;
-		} else if (v.type != STAMP_TLV_PAD)
+			break;
+		case STAMP_TLV_COS:
+			if (v.len != 4) {
+				out[at] |= STAMP_TLV_M;
+				break;
+			}
+			cos_reflect(r, rx, out + at + 4);
+			break;
+		default:
 			out[at] |= STAMP_TLV_U;
+		}
 	}
+}
+
+/* The TOS or traffic class octet the reply stamp_refl_reply() made
+ * last is to be sent with, a Class of Service TLV's: -1 when it had
+ * none, the socket's own. */
+int
+stamp_refl_reply_tos(const struct stamp_refl *r)
+{
+
+	return (r->reply_tos);
 }
 
 /*
@@ -431,6 +489,7 @@ stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
 	double			 now;
 
 	now = rx->mono != 0 ? rx->mono : stamp_mono();
+	r->reply_tos = -1;
 	w = STAMP_ANSWERED;
 	if (rx->len < STAMP_UNAUTH_LEN)
 		w = STAMP_DROP_SHORT;
@@ -483,8 +542,7 @@ stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
 	memcpy(out + 28, in + 4, 8);		/* ... Timestamp */
 	memcpy(out + 36, in + 12, 2);		/* ... Error Estimate */
 	out[40] = (uint8_t)(rx->ttl > 0 ? rx->ttl : 0);	/* ... TTL */
-	tlvs_reflect(out, rx->len, r->clk.sync, rx->ts_in != 0 ? rx->ts_in :
-	    STAMP_TSM_SW, r->c.ts_out != 0 ? r->c.ts_out : STAMP_TSM_SW);
+	tlvs_reflect(r, rx, out, rx->len);
 	r->st.answered++;
 	return ((ssize_t)rx->len);
 }

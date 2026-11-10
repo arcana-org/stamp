@@ -976,9 +976,111 @@ ATF_TC_BODY(sender_owd_bounds, tc)
 	stamp_clock_set(NULL);
 }
 
+/*
+ * The Class of Service TLV (RFC 8972 4.4): the sender's DSCP1; the
+ * reflector's DSCP2 and ECN as the request came, the reply to carry
+ * DSCP1, or, refused, the request's DSCP and RP 1; malformed when not
+ * 4 octets; no TOS known: DSCP2 0, the socket's own.
+ */
+ATF_TC_WITHOUT_HEAD(tlv_cos);
+ATF_TC_BODY(tlv_cos, tc)
+{
+	struct stamp_refl_conf	 c = { .stateful = false, .port = 862 };
+	struct stamp_sender_conf sc = { .cos = true, .dscp = 46, .ssid = 3 };
+	struct sockaddr_in	 a = sin4("192.0.2.1", 40000);
+	struct stamp_refl	*r;
+	struct stamp_sender	*s;
+	struct stamp_sample	 sm;
+	struct stamp_cos	 co;
+	struct stamp_tlv	 v;
+	struct stamp_rx		 rx;
+	struct timespec		 t1;
+	uint8_t			 p[128], out[STAMP_PKT_MAX];
+	size_t			 off;
+
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_CHECK_EQ(stamp_sender_len(s, 0), 52);
+	sc.tsinfo = true;
+	stamp_sender_free(s);
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_CHECK_EQ(stamp_sender_len(s, 0), 60);
+	ATF_CHECK_EQ(stamp_sender_len(s, 61), 64);
+	clock_gettime(CLOCK_REALTIME, &t1);
+	ATF_REQUIRE(stamp_sender_packet(s, p, 80, &t1, 1, NULL) == 0);
+	off = 0;
+	ATF_REQUIRE(stamp_tlv_next(p, 80, &off, &v) == 1);
+	ATF_CHECK(v.type == STAMP_TLV_TSINFO);
+	ATF_REQUIRE(stamp_tlv_next(p, 80, &off, &v) == 1);
+	ATF_CHECK(v.type == STAMP_TLV_COS && v.len == 4 && v.flags == 0);
+	ATF_CHECK(v.value[0] == 46 << 2 && v.value[1] == 0 &&
+	    v.value[2] == 0 && v.value[3] == 0);
+	ATF_REQUIRE(stamp_tlv_next(p, 80, &off, &v) == 1);
+	ATF_CHECK(v.type == STAMP_TLV_PAD && v.len == 16);
+	/* Not reflected yet: DSCP1 alone, RP 0. */
+	ATF_REQUIRE(stamp_cos_find(p, 80, &co) == 1);
+	ATF_CHECK(co.dscp1 == 46 && co.dscp2 == 0 && co.rp == 0);
+
+	/* Reflected: it came with DSCP 10 and ECN 1 (an ipfw setdscp on
+	 * the way, say); the reply to carry 46. */
+	ATF_REQUIRE((r = stamp_refl_new(&c)) != NULL);
+	ATF_CHECK_EQ(stamp_refl_reply_tos(r), -1);
+	memset(&rx, 0, sizeof(rx));
+	rx.pkt = p;
+	rx.len = 80;
+	rx.peer = (struct sockaddr *)&a;
+	rx.t2 = t1;
+	rx.mono = 1;
+	rx.tos = 10 << 2 | 1;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 80);
+	ATF_CHECK_EQ(stamp_refl_reply_tos(r), 46 << 2);
+	ATF_REQUIRE(stamp_cos_find(out, 80, &co) == 1);
+	ATF_CHECK_EQ(co.dscp1, 46);
+	ATF_CHECK_EQ(co.dscp2, 10);
+	ATF_CHECK_EQ(co.ecn, 1);
+	ATF_CHECK_EQ(co.rp, 0);
+	ATF_REQUIRE(stamp_sender_reply(s, out, 80, 1.01, NULL, &sm) == 1);
+	ATF_CHECK(sm.has_cos && sm.has_tsinfo);
+	ATF_CHECK(sm.cos.dscp2 == 10 && sm.cos.rp == 0);
+
+	/* Refused (46 among dscp_deny): the request's DSCP, RP 1. */
+	c.dscp_deny = (uint64_t)1 << 46;
+	ATF_REQUIRE(stamp_refl_setconf(r, &c) == 0);
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 80);
+	ATF_CHECK_EQ(stamp_refl_reply_tos(r), 10 << 2);
+	ATF_REQUIRE(stamp_cos_find(out, 80, &co) == 1);
+	ATF_CHECK(co.dscp1 == 46 && co.dscp2 == 10 && co.rp == 1);
+	/* ... and the TOS it came with not known: the socket's own. */
+	rx.tos = -1;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 80);
+	ATF_CHECK_EQ(stamp_refl_reply_tos(r), -1);
+	ATF_REQUIRE(stamp_cos_find(out, 80, &co) == 1);
+	ATF_CHECK(co.dscp2 == 0 && co.ecn == 0 && co.rp == 1);
+
+	/* Not 4 octets: malformed, none found; nothing asked of the
+	 * reply's TOS. */
+	p[55] = 5;
+	off = 52;
+	ATF_REQUIRE(stamp_tlv_next(p, 80, &off, &v) == 1);
+	ATF_REQUIRE(v.type == STAMP_TLV_COS && v.len == 5);
+	/* What follows it: a TLV again to the end. */
+	ATF_REQUIRE(stamp_tlv_put(p, 80, &off, STAMP_TLV_PAD, NULL,
+	    (uint16_t)(80 - off - STAMP_TLV_HDR)) == 0);
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 80);
+	ATF_CHECK_EQ(stamp_refl_reply_tos(r), -1);
+	ATF_CHECK(out[52] == STAMP_TLV_M);
+	ATF_CHECK(stamp_cos_find(out, 80, &co) == 0);
+	/* No TLV: the socket's own. */
+	ATF_REQUIRE(reply(r, p, STAMP_UNAUTH_LEN, (struct sockaddr *)&a, NULL,
+	    0, 2, out, NULL) == STAMP_UNAUTH_LEN);
+	ATF_CHECK_EQ(stamp_refl_reply_tos(r), -1);
+	stamp_refl_free(r);
+	stamp_sender_free(s);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 
+	ATF_TP_ADD_TC(tp, tlv_cos);
 	ATF_TP_ADD_TC(tp, clock_set);
 	ATF_TP_ADD_TC(tp, tlv_tsinfo);
 	ATF_TP_ADD_TC(tp, sender_owd);

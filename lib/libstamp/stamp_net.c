@@ -10,9 +10,11 @@
  * SCM_REALTIME timespec; a sender's SO_TS_MONOTONIC, SCM_MONOTONIC,
  * the other clock's derived from it; SCM_TIME_INFO saying whether the
  * hardware took it), the TTL or Hop Limit it came with is said
- * (IP_RECVTTL, IPV6_RECVHOPLIMIT), and the address it came to
+ * (IP_RECVTTL, IPV6_RECVHOPLIMIT), its TOS or traffic class
+ * (IP_RECVTOS, IPV6_RECVTCLASS), and the address it came to
  * (IP_RECVDSTADDR, IPV6_RECVPKTINFO), so that a reply leaves from it
- * (IP_SENDSRCADDR, IPV6_PKTINFO).  The socket's FIB is the process's,
+ * (IP_SENDSRCADDR, IPV6_PKTINFO), with the DSCP asked for (IP_TOS,
+ * IPV6_TCLASS).  The socket's FIB is the process's,
  * as setfib(1) or setfib(2) set it, or the one SO_SETFIB says.
  */
 
@@ -69,6 +71,7 @@ stamp_socket_fib(int af, uint16_t port, int flags, int fib)
 		struct sockaddr_in	*s4 = (struct sockaddr_in *)(void *)&ss;
 
 		(void)setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, sizeof(on));
+		(void)setsockopt(fd, IPPROTO_IP, IP_RECVTOS, &on, sizeof(on));
 		(void)setsockopt(fd, IPPROTO_IP, IP_RECVDSTADDR, &on,
 		    sizeof(on));
 		if (flags & STAMP_SOCK_REFLECTOR)
@@ -82,6 +85,8 @@ stamp_socket_fib(int af, uint16_t port, int flags, int fib)
 		(void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on,
 		    sizeof(on));
 		(void)setsockopt(fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on,
+		    sizeof(on));
+		(void)setsockopt(fd, IPPROTO_IPV6, IPV6_RECVTCLASS, &on,
 		    sizeof(on));
 		(void)setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on,
 		    sizeof(on));
@@ -122,6 +127,7 @@ stamp_recv(int fd, uint8_t *buf, size_t len, struct stamp_rxinfo *ri)
 
 	memset(ri, 0, sizeof(*ri));
 	ri->ttl = -1;
+	ri->tos = -1;
 	memset(&msg, 0, sizeof(msg));
 	iov.iov_base = buf;
 	iov.iov_len = len;
@@ -164,6 +170,15 @@ stamp_recv(int fd, uint8_t *buf, size_t len, struct stamp_rxinfo *ri)
 		} else if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type ==
 		    IP_RECVTTL && cm->cmsg_len >= CMSG_LEN(1)) {
 			ri->ttl = *(uint8_t *)CMSG_DATA(cm);
+		} else if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type ==
+		    IP_RECVTOS && cm->cmsg_len >= CMSG_LEN(1)) {
+			ri->tos = *(uint8_t *)CMSG_DATA(cm);
+		} else if (cm->cmsg_level == IPPROTO_IPV6 && cm->cmsg_type ==
+		    IPV6_TCLASS && cm->cmsg_len >= CMSG_LEN(sizeof(int))) {
+			int	tc;
+
+			memcpy(&tc, CMSG_DATA(cm), sizeof(tc));
+			ri->tos = tc & 0xff;
 		} else if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type ==
 		    IP_RECVDSTADDR && cm->cmsg_len >=
 		    CMSG_LEN(sizeof(struct in_addr))) {
@@ -217,24 +232,43 @@ stamp_recv(int fd, uint8_t *buf, size_t len, struct stamp_rxinfo *ri)
 	return (n);
 }
 
+/* A control message of level, type and len octets of data appended
+ * to msg's, its room in buf (len octets, aligned). */
+static void
+cmsg_add(struct msghdr *msg, int level, int type, const void *data,
+    size_t len)
+{
+	struct cmsghdr	*cm;
+
+	cm = (struct cmsghdr *)(void *)((char *)msg->msg_control +
+	    msg->msg_controllen);
+	cm->cmsg_level = level;
+	cm->cmsg_type = type;
+	cm->cmsg_len = CMSG_LEN(len);
+	memcpy(CMSG_DATA(cm), data, len);
+	msg->msg_controllen += CMSG_SPACE(len);
+}
+
 /*
  * buf sent to to, from the address from (NULL or of no family: the one
- * the routes choose) on interface ifindex (IPv6; 0 any).  The address
- * it came to not being of an interface of the socket's FIB (the
- * loopback's, in a FIB but 0), from the one the table chooses.  0, or
- * -1 with errno.
+ * the routes choose) on interface ifindex (IPv6; 0 any), with the TOS
+ * or traffic class octet tos (-1: the socket's).  The address it came
+ * to not being of an interface of the socket's FIB (the loopback's, in
+ * a FIB but 0), from the one the table chooses.  0, or -1 with errno.
  */
 int
 stamp_send(int fd, const uint8_t *buf, size_t len, const struct sockaddr *to,
-    const struct sockaddr *from, unsigned ifindex)
+    const struct sockaddr *from, unsigned ifindex, int tos)
 {
 	struct msghdr	 msg;
 	struct iovec	 iov;
-	struct cmsghdr	*cm;
 	union {
 		struct cmsghdr	hdr;
-		char		buf[128];
+		char		buf[256];
 	}		 cout;
+	struct in6_pktinfo pi6;
+	unsigned char	 tos4 = 0;
+	int		 tc = 0;
 
 	memset(&msg, 0, sizeof(msg));
 	memset(&cout, 0, sizeof(cout));
@@ -244,38 +278,44 @@ stamp_send(int fd, const uint8_t *buf, size_t len, const struct sockaddr *to,
 	msg.msg_namelen = to->sa_len;
 	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
+	msg.msg_control = cout.buf;
+	if (to->sa_family == AF_INET && tos >= 0) {
+		tos4 = (unsigned char)tos;
+		cmsg_add(&msg, IPPROTO_IP, IP_TOS, &tos4, sizeof(tos4));
+	} else if (to->sa_family == AF_INET6 && tos >= 0) {
+		tc = tos & 0xff;
+		cmsg_add(&msg, IPPROTO_IPV6, IPV6_TCLASS, &tc, sizeof(tc));
+	}
 	if (from != NULL && from->sa_family == AF_INET && to->sa_family ==
-	    AF_INET) {
-		msg.msg_control = cout.buf;
-		msg.msg_controllen = CMSG_SPACE(sizeof(struct in_addr));
-		cm = CMSG_FIRSTHDR(&msg);
-		cm->cmsg_level = IPPROTO_IP;
-		cm->cmsg_type = IP_SENDSRCADDR;
-		cm->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
-		memcpy(CMSG_DATA(cm), &((const struct sockaddr_in *)
-		    (const void *)from)->sin_addr, sizeof(struct in_addr));
-	} else if (from != NULL && from->sa_family == AF_INET6 &&
+	    AF_INET)
+		cmsg_add(&msg, IPPROTO_IP, IP_SENDSRCADDR, &((const struct
+		    sockaddr_in *)(const void *)from)->sin_addr,
+		    sizeof(struct in_addr));
+	else if (from != NULL && from->sa_family == AF_INET6 &&
 	    to->sa_family == AF_INET6) {
-		struct in6_pktinfo	pi6;
-
 		memset(&pi6, 0, sizeof(pi6));
 		pi6.ipi6_addr = ((const struct sockaddr_in6 *)
 		    (const void *)from)->sin6_addr;
 		pi6.ipi6_ifindex = ifindex;
-		msg.msg_control = cout.buf;
-		msg.msg_controllen = CMSG_SPACE(sizeof(pi6));
-		cm = CMSG_FIRSTHDR(&msg);
-		cm->cmsg_level = IPPROTO_IPV6;
-		cm->cmsg_type = IPV6_PKTINFO;
-		cm->cmsg_len = CMSG_LEN(sizeof(pi6));
-		memcpy(CMSG_DATA(cm), &pi6, sizeof(pi6));
+		cmsg_add(&msg, IPPROTO_IPV6, IPV6_PKTINFO, &pi6, sizeof(pi6));
 	}
+	if (msg.msg_controllen == 0)
+		msg.msg_control = NULL;
 	if (sendmsg(fd, &msg, 0) != -1)
 		return (0);
-	if (errno != EADDRNOTAVAIL || msg.msg_controllen == 0)
+	if (errno != EADDRNOTAVAIL || from == NULL || from->sa_family !=
+	    to->sa_family)
 		return (-1);
-	msg.msg_control = NULL;
+	/* Again from the address the table chooses, the TOS kept. */
+	memset(&cout, 0, sizeof(cout));
+	msg.msg_control = cout.buf;
 	msg.msg_controllen = 0;
+	if (to->sa_family == AF_INET && tos >= 0)
+		cmsg_add(&msg, IPPROTO_IP, IP_TOS, &tos4, sizeof(tos4));
+	else if (to->sa_family == AF_INET6 && tos >= 0)
+		cmsg_add(&msg, IPPROTO_IPV6, IPV6_TCLASS, &tc, sizeof(tc));
+	if (msg.msg_controllen == 0)
+		msg.msg_control = NULL;
 	return (sendmsg(fd, &msg, 0) == -1 ? -1 : 0);
 }
 

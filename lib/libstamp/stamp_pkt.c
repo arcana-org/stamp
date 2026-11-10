@@ -10,7 +10,9 @@
  * (RFC 8972 3), and the TLVs that may follow (RFC 8972 4): a flags
  * octet (U, M, I), the type, a 16-bit length and the value; the
  * Timestamp Information TLV (4.3, type 3) four octets, the sync source
- * and timestamping method of T2, then of T3.  The
+ * and timestamping method of T2, then of T3; the Class of Service TLV
+ * (4.4, type 4) four, DSCP1 (6 bits), DSCP2 (6), ECN (2), RP (2) and
+ * 16 reserved.  The
  * authenticated mode's (4.2.2, 4.3.2) would be STAMP_AUTH_LEN octets
  * and an HMAC: not yet.
  *
@@ -172,27 +174,56 @@ stamp_tlv_put(uint8_t *pkt, size_t len, size_t *off, uint8_t type,
 }
 
 /*
- * The Timestamp Information TLV of a reflected packet into ti: 1 when
- * the reflector filled it (no U flag: it knew it), 0 when there is
- * none or it did not, -1 when the TLVs go past the packet (EBADMSG).
+ * The first TLV of type, of vlen octets or more, of a reflected packet:
+ * 1 when the reflector filled it (neither U nor M: it knew it, as it
+ * was), 0 when there is none or it did not, -1 when the TLVs go past
+ * the packet (EBADMSG).
  */
+static int
+tlv_find(const uint8_t *pkt, size_t len, uint8_t type, uint16_t vlen,
+    struct stamp_tlv *v)
+{
+	size_t	off = STAMP_UNAUTH_LEN;
+	int	rc;
+
+	while ((rc = stamp_tlv_next(pkt, len, &off, v)) == 1) {
+		if (v->type != type || v->len < vlen)
+			continue;
+		return ((v->flags & (STAMP_TLV_U | STAMP_TLV_M)) ? 0 : 1);
+	}
+	return (rc);
+}
+
+/* The Timestamp Information TLV of a reflected packet into ti: as
+ * tlv_find(). */
 int
 stamp_tsinfo_find(const uint8_t *pkt, size_t len, struct stamp_tsinfo *ti)
 {
 	struct stamp_tlv	v;
-	size_t			off = STAMP_UNAUTH_LEN;
 	int			rc;
 
-	while ((rc = stamp_tlv_next(pkt, len, &off, &v)) == 1) {
-		if (v.type != STAMP_TLV_TSINFO || v.len < 4)
-			continue;
-		if (v.flags & (STAMP_TLV_U | STAMP_TLV_M))
-			return (0);
-		ti->sync_in = v.value[0];
-		ti->ts_in = v.value[1];
-		ti->sync_out = v.value[2];
-		ti->ts_out = v.value[3];
-		return (1);
-	}
-	return (rc);
+	if ((rc = tlv_find(pkt, len, STAMP_TLV_TSINFO, 4, &v)) != 1)
+		return (rc);
+	ti->sync_in = v.value[0];
+	ti->ts_in = v.value[1];
+	ti->sync_out = v.value[2];
+	ti->ts_out = v.value[3];
+	return (1);
+}
+
+/* The Class of Service TLV of a reflected packet into cos: as
+ * tlv_find(). */
+int
+stamp_cos_find(const uint8_t *pkt, size_t len, struct stamp_cos *cos)
+{
+	struct stamp_tlv	v;
+	int			rc;
+
+	if ((rc = tlv_find(pkt, len, STAMP_TLV_COS, 4, &v)) != 1)
+		return (rc);
+	cos->dscp1 = v.value[0] >> 2;
+	cos->dscp2 = (uint8_t)((v.value[0] & 0x03) << 4 | v.value[1] >> 4);
+	cos->ecn = (v.value[1] >> 2) & 0x03;
+	cos->rp = v.value[1] & 0x03;
+	return (1);
 }

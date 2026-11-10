@@ -13,6 +13,7 @@
 .Nm
 .Op Fl d
 .Op Fl C Ar source Ns Op : Ns Ar error
+.Op Fl D Ar dscps
 .Op Fl f Ar file
 .Op Fl m Cm stateless | stateful
 .Op Fl P Ar pidfile
@@ -63,8 +64,19 @@ says) and how the times were taken
 when the kernel says the hardware took the time a packet came in, else
 .Cm sw ;
 .Cm sw
-the time its reply leaves); another TLV but Extra Padding is marked
-unrecognised (its U flag).
+the time its reply leaves).
+So is a Class of Service TLV (section 4.4): the DSCP and ECN the
+request came with
+.Pq Dv IP_RECVTOS , IPV6_RECVTCLASS
+in DSCP2 and ECN, and the reply sent with the DSCP the sender asked
+for, DSCP1
+.Pq Dv IP_TOS , IPV6_TCLASS ,
+unless
+.Fl D
+refuses it: the reply then carries the DSCP the request came with,
+the TLV's RP 1.
+Another TLV but Extra Padding is marked unrecognised (its U flag), a
+Class of Service TLV not of 4 octets malformed (M).
 What follows the base is taken as TLVs only when it is TLVs to its end,
 none of type 0; anything else, padding, is copied as it is.
 Nor is a packet from port 0 or from
@@ -99,6 +111,11 @@ the clock's error in seconds (default the least the Error Estimate
 says).
 The replies' Error Estimate then says synchronised with that error, as
 the Timestamp Information TLV says that source.
+.It Fl D Ar dscps
+The DSCPs a Class of Service TLV may not ask a reply to carry:
+.Cm all ,
+.Cm none
+(the default), or a list of them, 0 to 63, by commas.
 .It Fl d
 Stay in the foreground and log to the standard error too, debugging
 messages among them.
@@ -150,6 +167,9 @@ As
 .It Cm rate-total Ar rate
 As
 .Fl R .
+.It Cm dscp-refuse Ar dscps
+As
+.Fl D .
 .El
 .Pp
 What the command line sets is kept over the file's.

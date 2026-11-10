@@ -6,8 +6,8 @@
 
 /*
  * libstamp: the Simple Two-way Active Measurement Protocol (RFC 8762),
- * with the Session-Sender Identifier and the Timestamp Information TLV
- * of RFC 8972.  The packets of the unauthenticated mode, the timestamps
+ * with the Session-Sender Identifier and the Timestamp Information and
+ * Class of Service TLVs of RFC 8972.  The packets of the unauthenticated mode, the timestamps
  * (NTP's 64-bit format and PTPv2's truncated one) and the Error
  * Estimate of RFC 4656, the clock's synchronisation, the reflector's
  * core (its sessions, its rate limits, its reply), the sender's (its
@@ -124,8 +124,10 @@ struct stamp_tlv {
 /* TLV types (RFC 8972 4, IANA's registry). */
 #define	STAMP_TLV_PAD		1	/* Extra Padding */
 #define	STAMP_TLV_TSINFO	3	/* Timestamp Information */
+#define	STAMP_TLV_COS		4	/* Class of Service */
 #define	STAMP_TLV_HDR		4
 #define	STAMP_TSINFO_LEN	8	/* the TLV, its header with it */
+#define	STAMP_COS_LEN		8	/* the same */
 
 /* The Timestamp Information TLV's value (RFC 8972 4.3): what the
  * reflector's clock is synchronised by and how it took T2 (in) and T3
@@ -134,10 +136,19 @@ struct stamp_tsinfo {
 	uint8_t		 sync_in, ts_in, sync_out, ts_out;
 };
 
+/* The Class of Service TLV's value (RFC 8972 4.4): the DSCP the sender
+ * asks the reply to carry (dscp1), the DSCP and ECN the request reached
+ * the reflector with (dscp2, ecn), and rp 1 when the reflector would
+ * not set dscp1 (its reply carrying the DSCP the request came with). */
+struct stamp_cos {
+	uint8_t		 dscp1, dscp2, ecn, rp;
+};
+
 int	stamp_tlv_next(const uint8_t *, size_t, size_t *, struct stamp_tlv *);
 int	stamp_tlv_put(uint8_t *, size_t, size_t *, uint8_t, const void *,
 	    uint16_t);
 int	stamp_tsinfo_find(const uint8_t *, size_t, struct stamp_tsinfo *);
+int	stamp_cos_find(const uint8_t *, size_t, struct stamp_cos *);
 
 /* ---- The Session-Reflector -------------------------------------- */
 
@@ -150,6 +161,10 @@ struct stamp_refl_conf {
 	unsigned	 sess_idle;	/* s; 0: STAMP_SESS_IDLE */
 	uint16_t	 port;		/* its own: never answered */
 	uint8_t		 ts_out;	/* how T3 is taken; 0: STAMP_TSM_SW */
+	/* The DSCPs a Class of Service TLV may not ask the reply to
+	 * carry (bit n for DSCP n): their replies carry the request's
+	 * DSCP, the TLV's RP 1. */
+	uint64_t	 dscp_deny;
 };
 #define	STAMP_SESS_MAX		4096
 #define	STAMP_SESS_IDLE		300
@@ -165,6 +180,8 @@ struct stamp_rx {
 	int			 tag;	/* of the session's key: a FIB */
 	double			 mono;	/* monotonic seconds; 0 now */
 	uint8_t			 ts_in;	/* how t2 was; 0: STAMP_TSM_SW */
+	int			 tos;	/* the TOS or traffic class octet;
+					   -1 unknown */
 };
 
 /* Why a packet was not answered. */
@@ -189,6 +206,7 @@ int	stamp_refl_setconf(struct stamp_refl *, const struct stamp_refl_conf *);
 void	stamp_refl_free(struct stamp_refl *);
 ssize_t	stamp_refl_reply(struct stamp_refl *, const struct stamp_rx *,
 	    uint8_t *, size_t, enum stamp_drop *);
+int	stamp_refl_reply_tos(const struct stamp_refl *);
 void	stamp_refl_send_time(uint8_t *, const struct timespec *);
 void	stamp_refl_expire(struct stamp_refl *, double);
 void	stamp_refl_stats(const struct stamp_refl *, struct stamp_refl_stats *);
@@ -211,6 +229,8 @@ struct stamp_sender_conf {
 	double		 timeout;	/* s a reply is waited; 0: 2 */
 	unsigned	 window;	/* in flight at most; 0: 256 */
 	bool		 tsinfo;	/* the Timestamp Information TLV */
+	bool		 cos;		/* the Class of Service TLV, asking */
+	uint8_t		 dscp;		/* the reply to carry this DSCP */
 	double		 owd_frac;	/* one way: both errors to half the
 					   round trip at most; 0: 0.1 */
 };
@@ -231,6 +251,8 @@ struct stamp_sample {
 	double			 err;	/* s: both Error Estimates' */
 	bool			 has_tsinfo;	/* the reflector filled it */
 	struct stamp_tsinfo	 tsinfo;
+	bool			 has_cos;	/* the same */
+	struct stamp_cos	 cos;
 	struct stamp_reflected	 r;	/* the reply, when not lost */
 };
 
@@ -273,6 +295,7 @@ struct stamp_rxinfo {
 	struct sockaddr_storage	 local;	/* ss_family 0: not said */
 	unsigned		 ifindex;
 	int			 ttl;	/* -1 not said */
+	int			 tos;	/* TOS or traffic class; -1 not said */
 	struct timespec		 t;	/* the kernel's, else the clock's */
 	struct timespec		 mono;	/* the same, monotonic */
 	bool			 hwts;	/* the kernel's by the hardware */
@@ -283,7 +306,7 @@ int	stamp_socket(int, uint16_t, int);
 int	stamp_socket_fib(int, uint16_t, int, int);
 ssize_t	stamp_recv(int, uint8_t *, size_t, struct stamp_rxinfo *);
 int	stamp_send(int, const uint8_t *, size_t, const struct sockaddr *,
-	    const struct sockaddr *, unsigned);
+	    const struct sockaddr *, unsigned, int);
 int	stamp_sockaddr(const char *, uint16_t, struct sockaddr_storage *);
 uint16_t stamp_sa_port(const struct sockaddr *);
 const char *stamp_sa_ntop(const struct sockaddr *, char *, size_t);
