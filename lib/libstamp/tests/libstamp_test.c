@@ -435,8 +435,279 @@ ATF_TC_BODY(reflect_rate, tc)
 	stamp_refl_free(r);
 }
 
+/* ---- The sender against the reflector's core, in process ---------- */
+
+/*
+ * A packet of the sender's sent at mono, reflected by r (its T2 at
+ * mono's time of day and T3 refl seconds later): the reply into out,
+ * its length; 0 when drop says the way out lost it.
+ */
+static ssize_t
+sendrefl(struct stamp_sender *s, struct stamp_refl *r, double mono,
+    double refl, bool drop, uint8_t *out, int *lostrc)
+{
+	struct stamp_sample	 sm;
+	struct sockaddr_in	 a = sin4("192.0.2.1", 40000);
+	struct stamp_rx		 rx;
+	struct timespec		 t1, t3;
+	uint8_t			 p[STAMP_UNAUTH_LEN];
+	ssize_t			 n;
+	int			 rc;
+
+	t1.tv_sec = 1778400000 + (time_t)mono;
+	t1.tv_nsec = (long)((mono - (double)(time_t)mono) * 1e9);
+	rc = stamp_sender_packet(s, p, sizeof(p), &t1, mono, &sm);
+	ATF_REQUIRE(rc != -1);
+	if (lostrc != NULL)
+		*lostrc = rc;
+	if (drop)
+		return (0);
+	memset(&rx, 0, sizeof(rx));
+	rx.pkt = p;
+	rx.len = sizeof(p);
+	rx.peer = (struct sockaddr *)&a;
+	rx.ttl = 64;
+	rx.t2 = t1;		/* the reflector's clock: any */
+	rx.t2.tv_sec += 5;
+	rx.mono = mono;
+	ATF_REQUIRE((n = stamp_refl_reply(r, &rx, out, STAMP_PKT_MAX, NULL)) ==
+	    STAMP_UNAUTH_LEN);
+	t3 = rx.t2;
+	t3.tv_nsec += (long)(refl * 1e9);
+	if (t3.tv_nsec >= 1000000000) {
+		t3.tv_sec++;
+		t3.tv_nsec -= 1000000000;
+	}
+	stamp_refl_send_time(out, &t3);
+	return (n);
+}
+
+ATF_TC_WITHOUT_HEAD(sender_rtt);
+ATF_TC_BODY(sender_rtt, tc)
+{
+	struct stamp_sender_conf  c = { .ssid = 7, .timeout = 1 };
+	struct stamp_refl_conf	  rc = { .stateful = false, .port = 862 };
+	struct stamp_sender	 *s;
+	struct stamp_refl	 *r;
+	struct stamp_sender_stats st;
+	struct stamp_sample	  sm;
+	uint8_t			  out[STAMP_PKT_MAX];
+
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	/* 50 ms there and back, 10 of them the reflector's own. */
+	ATF_REQUIRE(sendrefl(s, r, 100, 0.010, false, out, NULL) > 0);
+	ATF_CHECK_EQ(stamp_sender_next(s), 101);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 100.050, &sm) ==
+	    1);
+	ATF_CHECK(!sm.lost);
+	ATF_CHECK_MSG(sm.rtt > 0.0399 && sm.rtt < 0.0401, "rtt %g", sm.rtt);
+	ATF_CHECK_MSG(sm.refl > 0.0099 && sm.refl < 0.0101, "refl %g",
+	    sm.refl);
+	ATF_CHECK_EQ(sm.r.ssid, 7);
+	ATF_CHECK_EQ(sm.r.sttl, 64);
+	ATF_CHECK_EQ(stamp_sender_next(s), 0);
+	/* The same reply again; another session's; garbage. */
+	ATF_CHECK(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 100.06, &sm) ==
+	    0);
+	out[15] = 8;
+	ATF_CHECK(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 100.06, &sm) ==
+	    0);
+	ATF_CHECK(stamp_sender_reply(s, out, 43, 100.06, &sm) == -1);
+	/* The reflector's clock says more than the round trip: 0. */
+	ATF_REQUIRE(sendrefl(s, r, 101, 0.5, false, out, NULL) > 0);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 101.1, &sm) ==
+	    1);
+	ATF_CHECK_EQ(sm.rtt, 0);
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.sent, 2);
+	ATF_CHECK_EQ(st.received, 2);
+	ATF_CHECK_EQ(st.late, 1);
+	ATF_CHECK_EQ(st.foreign, 1);
+	ATF_CHECK_EQ(st.mode, STAMP_MODE_STATELESS);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+}
+
+/*
+ * 20 packets; out lost on the way out, back on the way back (and one
+ * of those coming after its timeout): the loss each way from a
+ * stateful reflector, the round trip's alone from a stateless one.
+ */
+static void
+loss_run(bool stateful, struct stamp_sender_stats *st)
+{
+	static const bool	  out_lost[20] = { [3] = true, [4] = true,
+	    [10] = true };
+	static const bool	  back_lost[20] = { [6] = true, [12] = true,
+	    [13] = true };
+	struct stamp_sender_conf  c = { .ssid = 1, .timeout = 1 };
+	struct stamp_refl_conf	  rc = { .port = 862 };
+	struct stamp_sender	 *s;
+	struct stamp_refl	 *r;
+	struct stamp_sample	  sm;
+	uint8_t			  out[STAMP_PKT_MAX], late[STAMP_PKT_MAX];
+	double			  t;
+	int			  i, lost = 0;
+
+	rc.stateful = stateful;
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	for (i = 0; i < 20; i++) {
+		t = 10 + i * 0.1;
+		while (stamp_sender_expire(s, t, &sm) == 1) {
+			ATF_CHECK(sm.lost);
+			lost++;
+		}
+		if (sendrefl(s, r, t, 0.001, out_lost[i], i == 12 ? late :
+		    out, NULL) == 0 || back_lost[i])
+			continue;
+		ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, t +
+		    0.02, &sm) == 1);
+	}
+	while (stamp_sender_expire(s, 100, &sm) == 1)
+		lost++;
+	ATF_CHECK_EQ(lost, 6);
+	/* 12's reply, after its timeout: late, still lost. */
+	ATF_CHECK(stamp_sender_reply(s, late, STAMP_UNAUTH_LEN, 100, &sm) == 0);
+	stamp_sender_stats(s, st);
+	ATF_CHECK_EQ(st->late, 1);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+}
+
+ATF_TC_WITHOUT_HEAD(sender_loss_stateful);
+ATF_TC_BODY(sender_loss_stateful, tc)
+{
+	struct stamp_sender_stats st;
+
+	loss_run(true, &st);
+	ATF_CHECK_EQ(st.mode, STAMP_MODE_STATEFUL);
+	ATF_CHECK_EQ(st.sent, 20);
+	ATF_CHECK_EQ(st.received, 14);
+	ATF_CHECK_EQ(st.lost, 6);
+	ATF_CHECK_EQ(st.fwd_lost, 3);
+	ATF_CHECK_EQ(st.back_lost, 3);
+	ATF_CHECK_EQ(st.unknown_lost, 0);
+}
+
+ATF_TC_WITHOUT_HEAD(sender_loss_stateless);
+ATF_TC_BODY(sender_loss_stateless, tc)
+{
+	struct stamp_sender_stats st;
+
+	loss_run(false, &st);
+	ATF_CHECK_EQ(st.mode, STAMP_MODE_STATELESS);
+	ATF_CHECK_EQ(st.received, 14);
+	ATF_CHECK_EQ(st.lost, 6);
+	ATF_CHECK_EQ(st.fwd_lost, 0);
+	ATF_CHECK_EQ(st.back_lost, 0);
+	ATF_CHECK_EQ(st.unknown_lost, 6);
+}
+
+ATF_TC_WITHOUT_HEAD(sender_window);
+ATF_TC_BODY(sender_window, tc)
+{
+	struct stamp_sender_conf  c = { .ssid = 1, .seq_set = true,
+	    .seq0 = 0xfffffffe, .window = 4 };
+	struct stamp_refl_conf	  rc = { .stateful = true, .port = 862 };
+	struct stamp_sender	 *s;
+	struct stamp_refl	 *r;
+	struct stamp_sender_stats st;
+	struct stamp_sample	  sm;
+	uint8_t			  out[STAMP_PKT_MAX];
+	int			  i, rcl;
+
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	/* Six in flight in a window of four, across the wrap of the
+	 * numbers: the two oldest given up. */
+	for (i = 0; i < 6; i++) {
+		ATF_REQUIRE(sendrefl(s, r, 1 + i * 0.01, 0, true, out, &rcl) ==
+		    0);
+		ATF_CHECK_EQ(rcl, i >= 4 ? 1 : 0);
+	}
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.lost, 2);
+	/* The seventh (sequence 4, 0xfffffffe + 6) gives up 0 and is
+	 * answered, the reflector's first: those before it not told
+	 * apart, there being no reply before them. */
+	ATF_REQUIRE(sendrefl(s, r, 2, 0, false, out, &rcl) > 0);
+	ATF_CHECK_EQ(rcl, 1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 2.01, &sm) ==
+	    1);
+	ATF_CHECK_EQ(sm.seq, 4);
+	ATF_CHECK_EQ(sm.r.seq, 0);
+	ATF_CHECK(stamp_sender_expire(s, 2.5, &sm) == 0);
+	ATF_CHECK(stamp_sender_expire(s, 4, &sm) == 1);
+	ATF_CHECK_EQ(sm.seq, 1);
+	ATF_CHECK(stamp_sender_expire(s, 4, &sm) == 1);
+	ATF_CHECK(stamp_sender_expire(s, 4, &sm) == 1);
+	ATF_CHECK_EQ(sm.seq, 3);
+	ATF_CHECK(stamp_sender_expire(s, 4, &sm) == 0);
+	ATF_CHECK_EQ(stamp_sender_next(s), 0);
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.mode, STAMP_MODE_STATEFUL);
+	ATF_CHECK_EQ(st.lost, 6);
+	ATF_CHECK_EQ(st.unknown_lost, 6);
+	ATF_CHECK_EQ(st.fwd_lost + st.back_lost, 0);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+}
+
+ATF_TC_WITHOUT_HEAD(sender_restart);
+ATF_TC_BODY(sender_restart, tc)
+{
+	struct stamp_sender_conf  c = { .ssid = 1, .timeout = 1 };
+	struct stamp_refl_conf	  rc = { .stateful = true, .port = 862 };
+	struct stamp_sender	 *s;
+	struct stamp_refl	 *r;
+	struct stamp_sender_stats st;
+	struct stamp_sample	  sm;
+	uint8_t			  out[STAMP_PKT_MAX];
+	int			  i;
+
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	for (i = 0; i < 5; i++) {
+		ATF_REQUIRE(sendrefl(s, r, 1 + i, 0, false, out, NULL) > 0);
+		ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 1.01 +
+		    i, &sm) == 1);
+	}
+	/* One lost, and the reflector started again: its counter from 0,
+	 * the gap not told apart. */
+	(void)sendrefl(s, r, 6, 0, true, out, NULL);
+	stamp_refl_free(r);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	ATF_REQUIRE(sendrefl(s, r, 7, 0, false, out, NULL) > 0);
+	ATF_CHECK(stamp_sender_expire(s, 7.5, &sm) == 1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 7.01, &sm) ==
+	    1);
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.lost, 1);
+	ATF_CHECK_EQ(st.unknown_lost, 1);
+	ATF_CHECK_EQ(st.fwd_lost + st.back_lost, 0);
+	/* From there on, told apart again. */
+	(void)sendrefl(s, r, 8, 0, true, out, NULL);
+	ATF_REQUIRE(sendrefl(s, r, 9, 0, false, out, NULL) > 0);
+	ATF_CHECK(stamp_sender_expire(s, 9.5, &sm) == 1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, STAMP_UNAUTH_LEN, 9.01, &sm) ==
+	    1);
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.fwd_lost, 1);
+	ATF_CHECK_EQ(st.back_lost, 0);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
+
+	ATF_TP_ADD_TC(tp, sender_rtt);
+	ATF_TP_ADD_TC(tp, sender_loss_stateful);
+	ATF_TP_ADD_TC(tp, sender_loss_stateless);
+	ATF_TP_ADD_TC(tp, sender_window);
+	ATF_TP_ADD_TC(tp, sender_restart);
 
 	ATF_TP_ADD_TC(tp, ntp_roundtrip);
 	ATF_TP_ADD_TC(tp, error_estimate);

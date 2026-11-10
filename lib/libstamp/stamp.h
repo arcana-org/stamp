@@ -9,8 +9,9 @@
  * with the Session-Sender Identifier of RFC 8972.  The packets of the
  * unauthenticated mode, the timestamps (NTP's 64-bit format and PTPv2's
  * truncated one) and the Error Estimate of RFC 4656, the reflector's
- * core (its sessions, its rate limits, its reply) and the UDP socket
- * both ends use.  See libstamp(3).
+ * core (its sessions, its rate limits, its reply), the sender's (its
+ * sequence, the replies matched, the round trip and the loss each way)
+ * and the UDP socket both ends use.  See libstamp(3).
  */
 
 #ifndef _STAMP_H_
@@ -151,9 +152,64 @@ void	stamp_refl_expire(struct stamp_refl *, double);
 void	stamp_refl_stats(const struct stamp_refl *, struct stamp_refl_stats *);
 double	stamp_mono(void);
 
+/* ---- The Session-Sender ----------------------------------------- */
+
+/* What a reflector does with the Sequence Number (RFC 8762 4.3). */
+enum stamp_mode {
+	STAMP_MODE_UNKNOWN = 0,		/* told by the first reply */
+	STAMP_MODE_STATELESS,		/* the sender's copied */
+	STAMP_MODE_STATEFUL		/* its own counter, a session */
+};
+
+struct stamp_sender_conf {
+	uint16_t	 ssid;
+	bool		 seq_set;	/* seq0 as given; else random */
+	uint32_t	 seq0;
+	enum stamp_mode	 mode;		/* the reflector's, if known */
+	double		 timeout;	/* s a reply is waited; 0: 2 */
+	unsigned	 window;	/* in flight at most; 0: 256 */
+};
+
+/* A packet's outcome: its reply, or none within the timeout. */
+struct stamp_sample {
+	uint32_t		 seq;	/* the sender's */
+	bool			 lost;
+	double			 rtt;	/* s: (T4 - T1) - (T3 - T2) */
+	double			 refl;	/* s: T3 - T2, the reflector's time */
+	struct stamp_reflected	 r;	/* the reply, when not lost */
+};
+
+struct stamp_sender_stats {
+	uint64_t	 sent, received;
+	uint64_t	 lost;		/* not back within the timeout */
+	/* Of the lost, told apart by a stateful reflector's counter: */
+	uint64_t	 fwd_lost;	/* never reached the reflector */
+	uint64_t	 back_lost;	/* reflected, the reply not back */
+	uint64_t	 unknown_lost;	/* a stateless one's, or not known */
+	uint64_t	 late;		/* a reply after its timeout, or again */
+	uint64_t	 foreign;	/* another SSID's, or no packet of ours */
+	enum stamp_mode	 mode;
+};
+
+struct stamp_sender;
+
+struct stamp_sender *stamp_sender_new(const struct stamp_sender_conf *);
+void	stamp_sender_free(struct stamp_sender *);
+int	stamp_sender_packet(struct stamp_sender *, uint8_t *, size_t,
+	    const struct timespec *, double, struct stamp_sample *);
+int	stamp_sender_reply(struct stamp_sender *, const uint8_t *, size_t,
+	    double, struct stamp_sample *);
+int	stamp_sender_expire(struct stamp_sender *, double,
+	    struct stamp_sample *);
+double	stamp_sender_next(const struct stamp_sender *);
+void	stamp_sender_stats(const struct stamp_sender *,
+	    struct stamp_sender_stats *);
+const char *stamp_mode_name(enum stamp_mode);
+
 /* ---- Sockets ---------------------------------------------------- */
 
 #define	STAMP_SOCK_REFLECTOR	0x01	/* TTL 255, the reply's */
+#define	STAMP_SOCK_MONOTONIC	0x02	/* the kernel's time monotonic */
 
 /* What came with a packet. */
 struct stamp_rxinfo {
@@ -162,10 +218,12 @@ struct stamp_rxinfo {
 	unsigned		 ifindex;
 	int			 ttl;	/* -1 not said */
 	struct timespec		 t;	/* the kernel's, else the clock's */
+	struct timespec		 mono;	/* the same, monotonic */
 	bool			 trunc;
 };
 
 int	stamp_socket(int, uint16_t, int);
+int	stamp_socket_fib(int, uint16_t, int, int);
 ssize_t	stamp_recv(int, uint8_t *, size_t, struct stamp_rxinfo *);
 int	stamp_send(int, const uint8_t *, size_t, const struct sockaddr *,
 	    const struct sockaddr *, unsigned);

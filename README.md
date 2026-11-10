@@ -2,24 +2,29 @@
 
 The Simple Two-way Active Measurement Protocol (STAMP, RFC 8762) for
 FreeBSD, with the Session-Sender Identifier of RFC 8972: a library, a
-Session-Reflector daemon and a minimal sender.
+Session-Reflector daemon and a sender.
 
 - **libstamp(3)**: the packets of the unauthenticated mode (room left
   for the authenticated one and read access to RFC 8972's TLVs), NTP
   and PTP timestamps, the Error Estimate (RFC 4656) from
   `ntp_gettime(2)`, the Session-Reflector's core (stateless or
-  stateful sessions, per-source and global rate limits, the reply), and
-  the UDP socket of either end (kernel receive timestamps by
-  `SO_TS_REALTIME`, the TTL and destination address by
+  stateful sessions, per-source and global rate limits, the reply), the
+  Session-Sender's core (a session's sequence, the replies matched, the
+  round trip with the reflector's time taken out, the loss on the way
+  out told from the loss on the way back by a stateful reflector's
+  counter), and the UDP socket of either end (in a FIB by `SO_SETFIB`;
+  kernel receive timestamps by `SO_TS_REALTIME`, or `SO_TS_MONOTONIC`
+  for a sender, the TTL and destination address by
   `IP_RECVTTL`/`IP_RECVDSTADDR`/`IPV6_RECVPKTINFO`, the reply from the
   address the request came to). A static library with no dependency
-  but libc, for a sender of another program to share.
+  but libc; another program's sender shares it (arcana-agent's).
 - **stampd(8)**: the reflector. UDP 862 (`-p`) on every address, IPv4
   and IPv6, in the FIB it is started in; root given up once bound
   (`chroot(2)` to `/var/empty`, the user `_stampd`); configuration
   read again on `SIGHUP`; syslog.
-- **stamp(1)**: send N test packets, print each reply's fields and the
-  round trip.
+- **stamp(1)**: send N test packets at an interval, print each reply's
+  fields and the round trip, then the loss, each way from a stateful
+  reflector.
 
 ## FIBs, the base way
 

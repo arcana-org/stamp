@@ -2,6 +2,10 @@
 
 TESTSDIR=	${TESTSBASE}/stamp/stampd
 ATF_TESTS_SH=	stampd_test
+# A relay that loses packets each way, for the sender's loss.
+PROGS=		udplossy
+BINDIR=		${TESTSDIR}
+MAN=
 
 # No mtree(8) hierarchy outside the tree: create the directory first.
 beforeinstall: .PHONY

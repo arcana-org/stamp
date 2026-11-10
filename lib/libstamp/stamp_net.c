@@ -7,11 +7,12 @@
 /*
  * The UDP socket of either end.  The time a packet came in is the
  * kernel's (SO_TIMESTAMP with SO_TS_CLOCK SO_TS_REALTIME, an
- * SCM_REALTIME timespec), the TTL or Hop Limit it came with is said
+ * SCM_REALTIME timespec; a sender's SO_TS_MONOTONIC, SCM_MONOTONIC),
+ * the TTL or Hop Limit it came with is said
  * (IP_RECVTTL, IPV6_RECVHOPLIMIT), and the address it came to
  * (IP_RECVDSTADDR, IPV6_RECVPKTINFO), so that a reply leaves from it
  * (IP_SENDSRCADDR, IPV6_PKTINFO).  The socket's FIB is the process's,
- * as setfib(1) or setfib(2) set it.
+ * as setfib(1) or setfib(2) set it, or the one SO_SETFIB says.
  */
 
 #include <sys/types.h>
@@ -31,9 +32,19 @@
 #include "stamp.h"
 
 /* A UDP socket of family af bound to port (0: any) on every address,
- * non-blocking; -1 with errno. */
+ * non-blocking, in the process's FIB; -1 with errno. */
 int
 stamp_socket(int af, uint16_t port, int flags)
+{
+
+	return (stamp_socket_fib(af, port, flags, -1));
+}
+
+/* The same in FIB fib (SO_SETFIB, before it is bound), -1 the
+ * process's.  STAMP_SOCK_MONOTONIC: the kernel's receive time on the
+ * monotonic clock (a sender's round trip), else the time of day. */
+int
+stamp_socket_fib(int af, uint16_t port, int flags, int fib)
 {
 	struct sockaddr_storage	ss;
 	int			fd, on = 1, v, e;
@@ -41,7 +52,14 @@ stamp_socket(int af, uint16_t port, int flags)
 	if ((fd = socket(af, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)) ==
 	    -1)
 		return (-1);
-	v = SO_TS_REALTIME;
+	if (fib >= 0 && setsockopt(fd, SOL_SOCKET, SO_SETFIB, &fib,
+	    sizeof(fib)) == -1) {
+		e = errno;
+		close(fd);
+		errno = e;
+		return (-1);
+	}
+	v = flags & STAMP_SOCK_MONOTONIC ? SO_TS_MONOTONIC : SO_TS_REALTIME;
 	(void)setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on));
 	(void)setsockopt(fd, SOL_SOCKET, SO_TS_CLOCK, &v, sizeof(v));
 	memset(&ss, 0, sizeof(ss));
@@ -99,7 +117,7 @@ stamp_recv(int fd, uint8_t *buf, size_t len, struct stamp_rxinfo *ri)
 		char		buf[256];
 	}		 cin;
 	ssize_t		 n;
-	bool		 have_t = false;
+	bool		 have_t = false, have_m = false;
 
 	memset(ri, 0, sizeof(*ri));
 	ri->ttl = -1;
@@ -122,6 +140,11 @@ stamp_recv(int fd, uint8_t *buf, size_t len, struct stamp_rxinfo *ri)
 		    CMSG_LEN(sizeof(struct timespec))) {
 			memcpy(&ri->t, CMSG_DATA(cm), sizeof(ri->t));
 			have_t = true;
+		} else if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type ==
+		    SCM_MONOTONIC && cm->cmsg_len >=
+		    CMSG_LEN(sizeof(struct timespec))) {
+			memcpy(&ri->mono, CMSG_DATA(cm), sizeof(ri->mono));
+			have_m = true;
 		} else if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type ==
 		    SCM_TIMESTAMP && cm->cmsg_len >=
 		    CMSG_LEN(sizeof(struct timeval))) {
@@ -164,6 +187,8 @@ stamp_recv(int fd, uint8_t *buf, size_t len, struct stamp_rxinfo *ri)
 	}
 	if (!have_t)
 		clock_gettime(CLOCK_REALTIME, &ri->t);
+	if (!have_m)
+		clock_gettime(CLOCK_MONOTONIC, &ri->mono);
 	return (n);
 }
 

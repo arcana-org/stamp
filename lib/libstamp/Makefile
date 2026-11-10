@@ -1,10 +1,11 @@
-# libstamp: STAMP's packets, timestamps and Session-Reflector, for
-# stampd(8), stamp(1) and a program of another tree's (a sender).  A
+# libstamp: STAMP's packets, timestamps, Session-Reflector and
+# Session-Sender, for stampd(8), stamp(1) and another tree's programs
+# (arcana-agent's sender).  A
 # static library, its objects position-independent so that a PIE or a
 # shared object links it; installed with its header for that.
 
 LIB=		stamp
-SRCS=		stamp_ts.c stamp_pkt.c stamp_refl.c stamp_net.c
+SRCS=		stamp_ts.c stamp_pkt.c stamp_refl.c stamp_send.c stamp_net.c
 INCS=		stamp.h
 MAN=		libstamp.3
 

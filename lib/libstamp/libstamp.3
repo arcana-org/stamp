@@ -30,7 +30,16 @@
 .Nm stamp_refl_expire ,
 .Nm stamp_refl_stats ,
 .Nm stamp_mono ,
+.Nm stamp_sender_new ,
+.Nm stamp_sender_free ,
+.Nm stamp_sender_packet ,
+.Nm stamp_sender_reply ,
+.Nm stamp_sender_expire ,
+.Nm stamp_sender_next ,
+.Nm stamp_sender_stats ,
+.Nm stamp_mode_name ,
 .Nm stamp_socket ,
+.Nm stamp_socket_fib ,
 .Nm stamp_recv ,
 .Nm stamp_send ,
 .Nm stamp_sockaddr ,
@@ -86,8 +95,26 @@ STAMP Library
 .Fn stamp_refl_stats "const struct stamp_refl *r" "struct stamp_refl_stats *st"
 .Ft double
 .Fn stamp_mono "void"
+.Ft "struct stamp_sender *"
+.Fn stamp_sender_new "const struct stamp_sender_conf *c"
+.Ft void
+.Fn stamp_sender_free "struct stamp_sender *s"
+.Ft int
+.Fn stamp_sender_packet "struct stamp_sender *s" "uint8_t *buf" "size_t len" "const struct timespec *t1" "double mono" "struct stamp_sample *lostp"
+.Ft int
+.Fn stamp_sender_reply "struct stamp_sender *s" "const uint8_t *pkt" "size_t len" "double mono" "struct stamp_sample *out"
+.Ft int
+.Fn stamp_sender_expire "struct stamp_sender *s" "double mono" "struct stamp_sample *out"
+.Ft double
+.Fn stamp_sender_next "const struct stamp_sender *s"
+.Ft void
+.Fn stamp_sender_stats "const struct stamp_sender *s" "struct stamp_sender_stats *st"
+.Ft "const char *"
+.Fn stamp_mode_name "enum stamp_mode m"
 .Ft int
 .Fn stamp_socket "int af" "uint16_t port" "int flags"
+.Ft int
+.Fn stamp_socket_fib "int af" "uint16_t port" "int flags" "int fib"
 .Ft ssize_t
 .Fn stamp_recv "int fd" "uint8_t *buf" "size_t len" "struct stamp_rxinfo *ri"
 .Ft int
@@ -104,8 +131,8 @@ The
 library implements the Simple Two-way Active Measurement Protocol
 (STAMP, RFC 8762) with the Session-Sender Identifier of RFC 8972:
 its packets in unauthenticated mode, its timestamps and error
-estimate, the Session-Reflector's core and the UDP socket of either
-end.
+estimate, the Session-Reflector's core, the Session-Sender's core and
+the UDP socket of either end.
 It has no other dependency than the C library.
 The authenticated mode
 .Pq Dv STAMP_AUTH , No 112 octets and an HMAC
@@ -236,6 +263,92 @@ ends the sessions idle for
 .Va sess_idle ;
 .Fn stamp_refl_stats
 says the packets answered, those dropped by reason and the sessions.
+.Ss The Session-Sender
+.Fn stamp_sender_new
+makes a sender of
+.Vt struct stamp_sender_conf ,
+one session to one reflector:
+.Bl -tag -width timeout
+.It Va ssid
+The Session-Sender Identifier its packets carry and its replies must.
+.It Va seq_set , seq0
+The first sequence number when
+.Va seq_set ;
+else a random one, never 0, so that the first reply tells a stateful
+reflector (whose new session counts from 0) from a stateless one.
+.It Va mode
+The reflector's mode when known
+.Pq Dv STAMP_MODE_STATELESS , STAMP_MODE_STATEFUL ;
+.Dv STAMP_MODE_UNKNOWN
+for the first reply to tell.
+.It Va timeout
+Seconds a reply is waited for (0: 2); one later is lost.
+.It Va window
+Packets in flight at most (0: 256).
+.El
+.Pp
+Like the reflector's, the core does no I/O: the caller sends and
+receives, each time on the monotonic clock
+.Pq Fn stamp_mono , No or Dv STAMP_SOCK_MONOTONIC Ns 's receive time .
+.Fn stamp_sender_packet
+writes the next test packet into
+.Fa buf ,
+its timestamp
+.Fa t1
+(the time of day), sent at
+.Fa mono ;
+it returns 0, or 1 when the window was full and its oldest packet
+given up, lost, that one's sample in
+.Fa *lostp .
+.Fn stamp_sender_reply
+matches a reply that came at
+.Fa mono
+to its packet by the SSID and the sender's sequence number it echoes:
+1 with its sample in
+.Fa *out ,
+0 for none of the session's packets in flight (another SSID, a reply
+late or again), \-1 for no reflected packet.
+A sample
+.Pq Vt struct stamp_sample
+has the round trip with the reflector's time taken out,
+.Va rtt
+= (T4 \- T1) \- (T3 \- T2), T1 and T4 monotonic and T2 and T3 both the
+reflector's, so that neither clock need be right;
+.Va refl
+is T3 \- T2, and
+.Va r
+the reply.
+.Fn stamp_sender_expire
+gives up the oldest packet in flight past its timeout: 1 with its
+sample
+.Pq Va lost ,
+0 when there is none; it is called until 0.
+.Fn stamp_sender_next
+is when the oldest packet in flight times out, 0 with none.
+.Pp
+.Fn stamp_sender_stats
+counts
+.Pq Vt struct stamp_sender_stats
+the packets sent, received and lost, the replies late (after their
+timeout, or again) and foreign, and the reflector's mode, told by its
+first reply.
+A stateful reflector's sequence number counts what reached it, so
+the losses between two replies are told apart:
+.Va fwd_lost
+never reached the reflector,
+.Va back_lost
+were reflected but not back in time.
+A stateless reflector's are the round trip's alone,
+.Va unknown_lost ,
+as are those before the first reply and those across a counter that
+went back or leapt (the reflector started again).
+The losses between two replies are counted once every packet before
+the later one is answered or lost, up to a timeout after; those after
+the last reply are in
+.Va lost
+alone.
+.Fn stamp_mode_name
+names a mode.
 .Ss Sockets
 .Fn stamp_socket
 opens a non-blocking UDP socket of family
@@ -252,10 +365,24 @@ the TTL or hop limit and the address it came to said.
 .Dv STAMP_SOCK_REFLECTOR
 in
 .Fa flags
-sends with TTL 255.
+sends with TTL 255;
+.Dv STAMP_SOCK_MONOTONIC
+has the kernel's receive time on the monotonic clock
+.Pq Dv SO_TS_MONOTONIC ,
+a sender's.
+.Fn stamp_socket_fib
+opens it in FIB
+.Fa fib
+.Pq Dv SO_SETFIB , No before it is bound ;
+\-1 for the process's.
 .Fn stamp_recv
 reads a packet and what came with it
-.Pq Vt struct stamp_rxinfo .
+.Pq Vt struct stamp_rxinfo :
+.Va t
+the time of day it came,
+.Va mono
+the monotonic time, each the kernel's when it said, else the
+clock's.
 .Fn stamp_send
 sends from the address
 .Fa from
@@ -276,7 +403,9 @@ return \-1 with
 .Va errno
 set on failure;
 .Fn stamp_refl_new
-returns
+and
+.Fn stamp_sender_new
+return
 .Dv NULL .
 .Sh SEE ALSO
 .Xr stamp 1 ,

@@ -94,7 +94,8 @@ stateless_body()
 	atf_check -o match:'^len=44 .* seq=100 ssid=1 sseq=100 ' \
 	    -o match:'^len=44 .* seq=101 ssid=1 sseq=101 ' \
 	    -o match:'^len=44 .* seq=102 ssid=1 sseq=102 ' \
-	    -o match:'^sent=3 received=3 rtt=' cat three.out
+	    -o match:'^sent=3 received=3 lost=0 forward=- backward=- reflector=stateless rtt=' \
+	    cat three.out
 	if has_inet6; then
 		atf_check -o match:"^len=44 from=::1 seq=3 ssid=5 sseq=3 ttl=33 rttl=255 $LINE" \
 		    "$S" -p $P -q 3 -s 5 -t 33 ::1
@@ -131,7 +132,9 @@ stateful_body()
 	atf_check -o save:a.out "$S" -p $P -S $SP -s 1 -q 500 -c 3 -i 0 127.0.0.1
 	atf_check -o match:'^len=44 .* seq=0 ssid=1 sseq=500 ' \
 	    -o match:'^len=44 .* seq=1 ssid=1 sseq=501 ' \
-	    -o match:'^len=44 .* seq=2 ssid=1 sseq=502 ' cat a.out
+	    -o match:'^len=44 .* seq=2 ssid=1 sseq=502 ' \
+	    -o match:'^sent=3 received=3 lost=0 forward=0 backward=0 unknown=0 reflector=stateful rtt=' \
+	    cat a.out
 	# Another SSID from the same port: a session of its own.
 	atf_check -o match:'^len=44 .* seq=0 ssid=2 sseq=9 ' \
 	    "$S" -p $P -S $SP -s 2 -q 9 127.0.0.1
@@ -144,7 +147,7 @@ stateful_body()
 	atf_check -o match:'^len=44 .* seq=0 ssid=1 sseq=1 ' \
 	    "$S" -p $P -s 1 -q 1 127.0.0.1
 	if has_inet6; then
-		atf_check -o save:b.out "$S" -p $P -S $SP -s 1 -c 2 -i 0 ::1
+		atf_check -o save:b.out "$S" -p $P -S $SP -s 1 -q 0 -c 2 -i 0 ::1
 		atf_check -o match:'^len=44 from=::1 seq=0 ssid=1 sseq=0 ' \
 		    -o match:'^len=44 from=::1 seq=1 ssid=1 sseq=1 ' cat b.out
 	fi
@@ -395,6 +398,52 @@ privileges_cleanup()
 	stop
 }
 
+atf_test_case loss cleanup
+loss_head()
+{
+	atf_set "descr" "stamp(1)'s loss through a relay that drops every" \
+	    "5th packet on the way out and every 7th reply on the way" \
+	    "back: told apart by a stateful reflector, the round trip's" \
+	    "alone from a stateless one; the round trip has the" \
+	    "reflector's time taken out"
+	atf_set "timeout" "60"
+}
+loss_body()
+{
+	local m L
+
+	L=$(atf_get_srcdir)/udplossy
+	for m in stateful stateless; do
+		P=$(port)
+		R=$(port)
+		start -m $m -p $P -r 0
+		"$L" $R $P 5 7 > relay.out 2>&1 &
+		echo $! > relay.pid
+		wait_match '^ready$' cat relay.out || atf_fail "no relay"
+		# 29 packets: 5 lost going (the 5th to the 25th), 3 of the 24
+		# replies coming (the 7th, 14th and 21st); the last answered,
+		# so that every loss is told.
+		atf_check -o save:$m.out "$S" -p $R -s 9 -c 29 -i 0.01 \
+		    -W 0.5 127.0.0.1
+		kill "$(cat relay.pid)"
+		rm relay.pid
+		stop
+		atf_check -o inline:'8\n' grep -c '^none$' $m.out
+		atf_check -o inline:'21\n' grep -c '^len=44 ' $m.out
+	done
+	atf_check -o match:'^sent=29 received=21 lost=8 forward=5 backward=3 unknown=0 reflector=stateful rtt=' \
+	    cat stateful.out
+	atf_check -o match:'^sent=29 received=21 lost=8 forward=- backward=- reflector=stateless rtt=' \
+	    cat stateless.out
+	# What the reflector said it took is no part of the round trip.
+	atf_check -o match:'^len=44 .* rtt=0\.[0-9]+ ' cat stateful.out
+}
+loss_cleanup()
+{
+	[ -f relay.pid ] && kill "$(cat relay.pid)" 2>/dev/null
+	stop
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case stateless
@@ -404,4 +453,5 @@ atf_init_test_cases()
 	atf_add_test_case fib
 	atf_add_test_case rc_script
 	atf_add_test_case privileges
+	atf_add_test_case loss
 }
