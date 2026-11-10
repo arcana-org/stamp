@@ -13,11 +13,21 @@
  * /var/empty, the user's (-u, _stampd) groups and ids.  SIGHUP reads
  * the configuration file again (-f); what the command line said stays.
  * The packets are libstamp's (stamp_refl_reply()): see stampd(8).
+ *
+ * The authenticated mode's keys come from a file (-K, else stampd.keys
+ * beside stampd.conf when it is there), its owner's alone, opened and
+ * read before root is given up and kept open: SIGHUP reads it again
+ * through that descriptor, so it is to be rewritten in place, never
+ * replaced (a replaced file is said, its keys kept, until a restart).
+ * A request whose HMAC no key verifies is dropped and counted, never
+ * answered; -A answers none that is not authenticated.  No key is ever
+ * logged.
  */
 
 #include <sys/param.h>
 #include <sys/event.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 
@@ -46,6 +56,9 @@
 #ifndef PATH_STAMPD_CONF
 #define	PATH_STAMPD_CONF	"/usr/local/etc/stampd.conf"
 #endif
+#ifndef PATH_STAMPD_KEYS
+#define	PATH_STAMPD_KEYS	"/usr/local/etc/stampd.keys"
+#endif
 #define	STAMPD_USER		"_stampd"
 #define	PATH_EMPTY		"/var/empty"
 #define	TICK_S			5	/* sessions ended, drops told */
@@ -56,6 +69,7 @@
 #define	SET_RATE		0x02
 #define	SET_TOTAL		0x04
 #define	SET_DSCP		0x08
+#define	SET_AUTH		0x10
 
 static struct stamp_refl_conf	 cl;	/* the command line's */
 static int			 cl_set;
@@ -65,14 +79,18 @@ static int			 fib;
 static int			 conf_dir = -1;	/* the file's, kept for a reload */
 static char			 conf_name[MAXPATHLEN];
 static bool			 conf_must;	/* -f: it must be there */
-static uint64_t			 drops_told;
+static uint64_t			 drops_told, auth_told, unauth_told;
+static int			 keys_fd = -1;	/* the key file, kept open */
+static const char		*keys_path;
+static struct stamp_key		*keys;
+static size_t			 nkeys;
 
 static void
 usage(void)
 {
 
-	fprintf(stderr, "usage: stampd [-d] [-C source[:error]] [-D dscps] "
-	    "[-f file]\n"
+	fprintf(stderr, "usage: stampd [-Ad] [-C source[:error]] [-D dscps] "
+	    "[-f file] [-K keyfile]\n"
 	    "              [-m stateless | stateful] [-P pidfile] [-p port]\n"
 	    "              [-r rate[/burst]] [-R rate] [-u user]\n");
 	exit(1);
@@ -123,6 +141,19 @@ parse_location(const char *s, struct stamp_refl_conf *c)
 		c->loc_hide = false;
 	else if (strcmp(s, "hide") == 0)
 		c->loc_hide = true;
+	else
+		return (false);
+	return (true);
+}
+
+static bool
+parse_auth(const char *s, struct stamp_refl_conf *c)
+{
+
+	if (strcmp(s, "required") == 0)
+		c->auth_only = true;
+	else if (strcmp(s, "optional") == 0)
+		c->auth_only = false;
 	else
 		return (false);
 	return (true);
@@ -231,11 +262,13 @@ conf_read(struct stamp_refl_conf *c, char *why, size_t whylen)
 		    (strcmp(key, "rate") == 0 && parse_rate(val, c)) ||
 		    (strcmp(key, "rate-total") == 0 && parse_total(val, c)) ||
 		    (strcmp(key, "dscp-refuse") == 0 && parse_dscps(val, c)) ||
-		    (strcmp(key, "location") == 0 && parse_location(val, c)))) {
+		    (strcmp(key, "location") == 0 && parse_location(val, c)) ||
+		    (strcmp(key, "auth") == 0 && parse_auth(val, c)))) {
 			(void)snprintf(why, whylen, "%s, line %d: \"%s\" is not "
 			    "mode stateless|stateful, rate rate[/burst], "
-			    "rate-total rate, dscp-refuse all|none|d,d,... or "
-			    "location show|hide", conf_name, n, key);
+			    "rate-total rate, dscp-refuse all|none|d,d,..., "
+			    "location show|hide or auth required|optional",
+			    conf_name, n, key);
 			error = -1;
 		}
 	}
@@ -254,6 +287,41 @@ cmdline:
 		c->rate_total = cl.rate_total;
 	if (cl_set & SET_DSCP)
 		c->dscp_deny = cl.dscp_deny;
+	if (cl_set & SET_AUTH)
+		c->auth_only = cl.auth_only;
+	c->keys = keys;
+	c->nkeys = nkeys;
+	return (0);
+}
+
+/*
+ * The keys read again through the descriptor kept (stamp_keys_read()):
+ * 0, nothing changed when -1 and why.  A file replaced (unlinked, the
+ * descriptor's no longer its name's) is not read: a restart reads the
+ * new one.
+ */
+static int
+keys_reload(char *why, size_t whylen)
+{
+	struct stamp_key	*k;
+	struct stat		 st;
+	size_t			 n;
+	char			 w[256];
+
+	if (keys_fd == -1)
+		return (0);
+	if (fstat(keys_fd, &st) == 0 && st.st_nlink == 0) {
+		(void)snprintf(why, whylen, "%s was replaced, not rewritten: "
+		    "its keys are read when stampd is started again", keys_path);
+		return (-1);
+	}
+	if (stamp_keys_read(keys_fd, &k, &n, w, sizeof(w)) == -1) {
+		(void)snprintf(why, whylen, "%s: %s", keys_path, w);
+		return (-1);
+	}
+	stamp_keys_free(keys, nkeys);
+	keys = k;
+	nkeys = n;
 	return (0);
 }
 
@@ -274,9 +342,10 @@ conf_say(const struct stamp_refl_conf *c, const char *what)
 	else
 		(void)snprintf(total, sizeof(total), "no limit in all");
 	syslog(LOG_INFO, "%s: %s, %s, %s, %d DSCPs refused a reply, "
-	    "locations %s", what, c->stateful ? "stateful" : "stateless", rate,
-	    total, __builtin_popcountll(c->dscp_deny), c->loc_hide ? "hidden" :
-	    "shown");
+	    "locations %s, %zu key%s, %s", what, c->stateful ? "stateful" :
+	    "stateless", rate, total, __builtin_popcountll(c->dscp_deny),
+	    c->loc_hide ? "hidden" : "shown", c->nkeys, c->nkeys == 1 ? "" :
+	    "s", c->auth_only ? "authenticated only" : "authenticated or not");
 }
 
 /* The packets waiting on fd, each answered or dropped. */
@@ -311,7 +380,8 @@ reflect(int fd)
 		    0)
 			continue;
 		clock_gettime(CLOCK_REALTIME, &t3);
-		stamp_refl_send_time(out, &t3);
+		if (stamp_refl_finish(refl, out, (size_t)n, &t3) == -1)
+			continue;
 		if (stamp_send(fd, out, (size_t)n, rx.peer, rx.local,
 		    ri.ifindex, stamp_refl_reply_tos(refl)) == -1)
 			syslog(LOG_DEBUG, "a reply to %s: %m",
@@ -330,6 +400,15 @@ drops_tell(void)
 		syslog(LOG_INFO, "%ju requests over the rate limits dropped",
 		    (uintmax_t)st.dropped[STAMP_DROP_RATE]);
 	drops_told = st.dropped[STAMP_DROP_RATE];
+	/* Tampered with, or under a key not ours: said, as counted. */
+	if (st.dropped[STAMP_DROP_AUTH] != auth_told)
+		syslog(LOG_NOTICE, "%ju requests failing authentication dropped",
+		    (uintmax_t)st.dropped[STAMP_DROP_AUTH]);
+	auth_told = st.dropped[STAMP_DROP_AUTH];
+	if (st.dropped[STAMP_DROP_UNAUTH] != unauth_told)
+		syslog(LOG_INFO, "%ju requests not authenticated dropped",
+		    (uintmax_t)st.dropped[STAMP_DROP_UNAUTH]);
+	unauth_told = st.dropped[STAMP_DROP_UNAUTH];
 }
 
 int
@@ -340,14 +419,24 @@ main(int argc, char *argv[])
 	struct passwd	*pw = NULL;
 	const char	*pidfile = NULL, *user = STAMPD_USER, *e;
 	const char	*conf = PATH_STAMPD_CONF;
-	char		 why[512], path[MAXPATHLEN];
+	char		 why[512], path[MAXPATHLEN], w[256];
+	bool		 keys_must = false;
 	size_t		 len;
 	pid_t		 other;
 	int		 ch, kq, fds[2], nfds, i, n, port = STAMP_PORT, all;
 	bool		 debug = false;
 
-	while ((ch = getopt(argc, argv, "C:D:df:m:P:p:R:r:u:")) != -1)
+	keys_path = PATH_STAMPD_KEYS;
+	while ((ch = getopt(argc, argv, "AC:D:df:K:m:P:p:R:r:u:")) != -1)
 		switch (ch) {
+		case 'A':
+			cl.auth_only = true;
+			cl_set |= SET_AUTH;
+			break;
+		case 'K':
+			keys_path = optarg;
+			keys_must = true;
+			break;
 		case 'C':
 			if (stamp_clock_set(optarg) == -1)
 				errx(1, "-C %s: ntp, ptp, ssu, gnss or local, "
@@ -414,6 +503,12 @@ main(int argc, char *argv[])
 	if ((conf_dir = open(dirname(path), O_DIRECTORY | O_CLOEXEC)) == -1 &&
 	    conf_must)
 		err(1, "%s", dirname(path));
+	/* The keys, while root reads them: the file kept open. */
+	if ((keys_fd = open(keys_path, O_RDONLY | O_CLOEXEC)) == -1) {
+		if (errno != ENOENT || keys_must)
+			err(1, "%s", keys_path);
+	} else if (stamp_keys_read(keys_fd, &keys, &nkeys, w, sizeof(w)) == -1)
+		errx(1, "%s: %s", keys_path, w);
 	if (conf_read(&cur, why, sizeof(why)) == -1)
 		errx(1, "%s", why);
 	cur.port = (uint16_t)port;
@@ -537,10 +632,16 @@ main(int argc, char *argv[])
 					pidfile_remove(pfh);
 					exit(0);
 				}
+				if (keys_reload(why, sizeof(why)) == -1)
+					syslog(LOG_ERR, "%s: the keys kept as "
+					    "they were", why);
 				if (conf_read(&c, why, sizeof(why)) == -1) {
 					syslog(LOG_ERR, "%s: the configuration "
 					    "kept as it was", why);
-					break;
+					/* The keys read, with it. */
+					c = cur;
+					c.keys = keys;
+					c.nkeys = nkeys;
 				}
 				c.port = (uint16_t)port;
 				if (stamp_refl_setconf(refl, &c) == -1) {

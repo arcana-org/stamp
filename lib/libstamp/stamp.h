@@ -13,7 +13,9 @@
  * Estimate of RFC 4656, the clock's synchronisation, the reflector's
  * core (its sessions, its rate limits, its reply), the sender's (its
  * sequence, the replies matched, the round trip, the delay and the
- * loss each way) and the UDP socket both ends use.  See libstamp(3).
+ * loss each way), the authenticated mode (RFC 8762 4.4, RFC 8972's
+ * HMAC TLV: HMAC-SHA-256-128 by libcrypto, a key an SSID's) and the UDP
+ * socket both ends use.  See libstamp(3).
  */
 
 #ifndef _STAMP_H_
@@ -31,18 +33,45 @@
 
 #define	STAMP_PORT		862	/* RFC 8762 section 4.1 */
 #define	STAMP_UNAUTH_LEN	44	/* the base packet, both ways */
-#define	STAMP_AUTH_LEN		112	/* authenticated mode's (not yet) */
+#define	STAMP_AUTH_LEN		112	/* the authenticated mode's */
 #define	STAMP_PKT_MAX		9000	/* about a jumbo frame's payload */
 
 /* The Error Estimate (RFC 4656 section 4.1.2). */
 #define	STAMP_EE_S		0x8000	/* synchronised to UTC */
 #define	STAMP_EE_Z		0x4000	/* the timestamps PTP's, else NTP's */
 
-/* Packet modes: only the unauthenticated one is implemented. */
-enum stamp_auth {
-	STAMP_UNAUTH = 0,
-	STAMP_AUTH = 1
+/* ---- The authenticated mode ------------------------------------- */
+
+#define	STAMP_HMAC_LEN		16	/* HMAC-SHA-256 truncated to 128 bits */
+#define	STAMP_KEY_MIN		16	/* octets */
+#define	STAMP_KEY_MAX		64
+#define	STAMP_KEYS_MAX		4096	/* in a file, a reflector */
+#define	STAMP_SSID_ANY		(-1)
+
+/* A key and the sessions it is for: those of its SSID, or any. */
+struct stamp_key {
+	int32_t		 ssid;		/* 0 to 65535, or STAMP_SSID_ANY */
+	size_t		 len;
+	uint8_t		 key[STAMP_KEY_MAX];
 };
+
+int	stamp_hmac(const struct stamp_key *, const uint8_t *, size_t,
+	    const uint8_t *, size_t, uint8_t *);
+bool	stamp_auth_layout(const uint8_t *, size_t);
+uint16_t stamp_auth_ssid(const uint8_t *);
+bool	stamp_auth_verify(const struct stamp_key *, const uint8_t *, size_t);
+int	stamp_auth_seal(const struct stamp_key *, uint8_t *, size_t);
+int	stamp_auth_tlv_verify(const struct stamp_key *, const uint8_t *,
+	    size_t, size_t);
+int	stamp_auth_tlv_seal(const struct stamp_key *, uint8_t *, size_t,
+	    size_t);
+void	stamp_auth_narrow(uint8_t *, size_t, bool);
+void	stamp_auth_widen(uint8_t *, size_t, bool);
+void	stamp_auth_send_time(uint8_t *, const struct timespec *);
+int	stamp_keys_parse(const char *, size_t, struct stamp_key **, size_t *,
+	    char *, size_t);
+int	stamp_keys_read(int, struct stamp_key **, size_t *, char *, size_t);
+void	stamp_keys_free(struct stamp_key *, size_t);
 
 /* ---- Timestamps ------------------------------------------------- */
 
@@ -82,7 +111,7 @@ int	stamp_clock_set(const char *);
 const char *stamp_sync_name(uint8_t);
 const char *stamp_tsm_name(uint8_t);
 
-/* ---- Packets (unauthenticated mode) ----------------------------- */
+/* ---- Packets (the unauthenticated layout) ----------------------- */
 
 /* A Session-Sender test packet (RFC 8762 4.2.1, RFC 8972 3). */
 struct stamp_test {
@@ -128,10 +157,12 @@ struct stamp_tlv {
 #define	STAMP_TLV_TSINFO	3	/* Timestamp Information */
 #define	STAMP_TLV_COS		4	/* Class of Service */
 #define	STAMP_TLV_DM		5	/* Direct Measurement */
+#define	STAMP_TLV_HMAC		8	/* HMAC, the authenticated mode's */
 #define	STAMP_TLV_HDR		4
 #define	STAMP_TSINFO_LEN	8	/* the TLV, its header with it */
 #define	STAMP_COS_LEN		8	/* the same */
 #define	STAMP_DM_LEN		16	/* the same */
+#define	STAMP_HMAC_TLV_LEN	20	/* the same */
 /* The Location TLV a sender asks with: the ports, then the destination
  * and source address sub-TLVs (4 + 16 octets each). */
 #define	STAMP_LOCATION_LEN	48
@@ -209,6 +240,12 @@ struct stamp_refl_conf {
 	/* A Location TLV's ports and addresses not said (zero), as
 	 * RFC 8972 4.2 lets a reflector's policy. */
 	bool		 loc_hide;
+	/* The keys of the authenticated mode (copied): a request of its
+	 * layout answered when one for its SSID, or for any, verifies;
+	 * auth_only, one of the unauthenticated layout never. */
+	const struct stamp_key *keys;
+	size_t		 nkeys;
+	bool		 auth_only;
 };
 #define	STAMP_SESS_MAX		4096
 #define	STAMP_SESS_IDLE		300
@@ -234,12 +271,18 @@ enum stamp_drop {
 	STAMP_DROP_SHORT,		/* under the base packet */
 	STAMP_DROP_PORT,		/* from port 0 or the reflector's */
 	STAMP_DROP_RATE,		/* over a rate limit */
-	STAMP_DROP_NOMEM
+	STAMP_DROP_NOMEM,
+	STAMP_DROP_AUTH,		/* authenticated, no key verifying it:
+					   tampered with, or a key not ours */
+	STAMP_DROP_UNAUTH,		/* not authenticated, to auth_only */
+	STAMP_DROP_MAX
 };
 
 struct stamp_refl_stats {
 	uint64_t	 answered;
-	uint64_t	 dropped[5];	/* by enum stamp_drop */
+	uint64_t	 dropped[STAMP_DROP_MAX];	/* by enum stamp_drop */
+	uint64_t	 tlv_failed;	/* answered, the HMAC TLV wrong: the
+					   TLVs not looked at, flagged I */
 	size_t		 sessions;
 };
 
@@ -252,6 +295,8 @@ ssize_t	stamp_refl_reply(struct stamp_refl *, const struct stamp_rx *,
 	    uint8_t *, size_t, enum stamp_drop *);
 int	stamp_refl_reply_tos(const struct stamp_refl *);
 void	stamp_refl_send_time(uint8_t *, const struct timespec *);
+int	stamp_refl_finish(const struct stamp_refl *, uint8_t *, size_t,
+	    const struct timespec *);
 void	stamp_refl_expire(struct stamp_refl *, double);
 void	stamp_refl_stats(const struct stamp_refl *, struct stamp_refl_stats *);
 double	stamp_mono(void);
@@ -279,6 +324,8 @@ struct stamp_sender_conf {
 	bool		 location;	/* the Location TLV */
 	double		 owd_frac;	/* one way: both errors to half the
 					   round trip at most; 0: 0.1 */
+	/* The authenticated mode, under this key (copied); NULL not. */
+	const struct stamp_key *key;
 };
 #define	STAMP_OWD_FRAC		0.1
 
@@ -316,6 +363,10 @@ struct stamp_sender_stats {
 	uint64_t	 unknown_lost;	/* a stateless one's, or not known */
 	uint64_t	 late;		/* a reply after its timeout, or again */
 	uint64_t	 foreign;	/* another SSID's, or no packet of ours */
+	uint64_t	 auth_failed;	/* authenticated, the HMAC wrong, or
+					   not authenticated: passed over */
+	uint64_t	 tlv_failed;	/* the HMAC TLV wrong, or flagged I by
+					   the reflector: its TLVs not used */
 	enum stamp_mode	 mode;
 	/* The loss each way by the Direct Measurement TLV's counters,
 	 * since the first reply that had them (dm_told): forward the

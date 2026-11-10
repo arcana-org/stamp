@@ -38,6 +38,7 @@
 .Nm stamp_refl_reply ,
 .Nm stamp_refl_reply_tos ,
 .Nm stamp_refl_send_time ,
+.Nm stamp_refl_finish ,
 .Nm stamp_refl_expire ,
 .Nm stamp_refl_stats ,
 .Nm stamp_mono ,
@@ -56,11 +57,24 @@
 .Nm stamp_send ,
 .Nm stamp_sockaddr ,
 .Nm stamp_sa_port ,
-.Nm stamp_sa_ntop
+.Nm stamp_sa_ntop ,
+.Nm stamp_hmac ,
+.Nm stamp_auth_layout ,
+.Nm stamp_auth_ssid ,
+.Nm stamp_auth_verify ,
+.Nm stamp_auth_seal ,
+.Nm stamp_auth_tlv_verify ,
+.Nm stamp_auth_tlv_seal ,
+.Nm stamp_auth_narrow ,
+.Nm stamp_auth_widen ,
+.Nm stamp_auth_send_time ,
+.Nm stamp_keys_parse ,
+.Nm stamp_keys_read ,
+.Nm stamp_keys_free
 .Nd Simple Two-way Active Measurement Protocol
 .Sh LIBRARY
 STAMP Library
-.Pq libstamp, -lstamp
+.Pq libstamp, -lstamp -lcrypto
 .Sh SYNOPSIS
 .In stamp.h
 .Ft int
@@ -123,6 +137,8 @@ STAMP Library
 .Fn stamp_refl_reply_tos "const struct stamp_refl *r"
 .Ft void
 .Fn stamp_refl_send_time "uint8_t *out" "const struct timespec *t3"
+.Ft int
+.Fn stamp_refl_finish "const struct stamp_refl *r" "uint8_t *out" "size_t len" "const struct timespec *t3"
 .Ft void
 .Fn stamp_refl_expire "struct stamp_refl *r" "double mono"
 .Ft void
@@ -161,6 +177,32 @@ STAMP Library
 .Fn stamp_sa_port "const struct sockaddr *sa"
 .Ft "const char *"
 .Fn stamp_sa_ntop "const struct sockaddr *sa" "char *buf" "size_t len"
+.Ft int
+.Fn stamp_hmac "const struct stamp_key *k" "const uint8_t *a" "size_t alen" "const uint8_t *b" "size_t blen" "uint8_t *out"
+.Ft bool
+.Fn stamp_auth_layout "const uint8_t *pkt" "size_t len"
+.Ft uint16_t
+.Fn stamp_auth_ssid "const uint8_t *pkt"
+.Ft bool
+.Fn stamp_auth_verify "const struct stamp_key *k" "const uint8_t *pkt" "size_t len"
+.Ft int
+.Fn stamp_auth_seal "const struct stamp_key *k" "uint8_t *pkt" "size_t len"
+.Ft int
+.Fn stamp_auth_tlv_verify "const struct stamp_key *k" "const uint8_t *pkt" "size_t len" "size_t base"
+.Ft int
+.Fn stamp_auth_tlv_seal "const struct stamp_key *k" "uint8_t *pkt" "size_t len" "size_t base"
+.Ft void
+.Fn stamp_auth_narrow "uint8_t *pkt" "size_t len" "bool refl"
+.Ft void
+.Fn stamp_auth_widen "uint8_t *pkt" "size_t ulen" "bool refl"
+.Ft void
+.Fn stamp_auth_send_time "uint8_t *pkt" "const struct timespec *t3"
+.Ft int
+.Fn stamp_keys_parse "const char *text" "size_t len" "struct stamp_key **keys" "size_t *n" "char *why" "size_t whylen"
+.Ft int
+.Fn stamp_keys_read "int fd" "struct stamp_key **keys" "size_t *n" "char *why" "size_t whylen"
+.Ft void
+.Fn stamp_keys_free "struct stamp_key *keys" "size_t n"
 .Sh DESCRIPTION
 The
 .Nm
@@ -168,16 +210,16 @@ library implements the Simple Two-way Active Measurement Protocol
 (STAMP, RFC 8762) with the Session-Sender Identifier and the
 Location, Timestamp Information, Class of Service and Direct
 Measurement TLVs of RFC 8972:
-its packets in unauthenticated mode, its timestamps and error
-estimate, the clock's synchronisation, the Session-Reflector's core,
-the Session-Sender's core and the UDP socket of either end.
-It has no other dependency than the C library.
-The authenticated mode
-.Pq Dv STAMP_AUTH , No 112 octets and an HMAC
-is not implemented yet; of the TLVs that follow the base packet, the
-Location, Timestamp Information, Class of Service and Direct
-Measurement TLVs are filled by the reflector and read by the sender,
-the others marked unrecognised.
+its packets in either mode, unauthenticated and authenticated (RFC
+8762 section 4.4 and the HMAC TLV of RFC 8972 section 4.8), its
+timestamps and error estimate, the clock's synchronisation, the
+Session-Reflector's core, the Session-Sender's core and the UDP socket
+of either end.
+It depends on the C library and, for the HMAC, on libcrypto.
+Of the TLVs that follow the base packet, the Location, Timestamp
+Information, Class of Service and Direct Measurement TLVs are filled
+by the reflector and read by the sender, the HMAC TLV made and checked
+in the authenticated mode, the others marked unrecognised.
 .Ss Packets
 .Fn stamp_test_encode
 writes a Session-Sender test packet
@@ -402,6 +444,12 @@ their replies carry the DSCP the request came with, the TLV's RP 1.
 .It Va loc_hide
 A Location TLV's ports and addresses are not said (zero), as RFC 8972
 lets a reflector's policy.
+.It Va keys , nkeys
+The keys of the authenticated mode, copied
+.Pq at most Dv STAMP_KEYS_MAX : No see Sx The authenticated mode .
+.It Va auth_only
+A request that is not of the authenticated layout is not answered
+.Pq Dv STAMP_DROP_UNAUTH .
 .El
 .Pp
 .Fn stamp_refl_setconf
@@ -447,19 +495,26 @@ Service TLV's DSCP1, or, refused by
 .Va dscp_deny ,
 the request's DSCP; \-1 (the socket's own) when the request had no
 such TLV, or its TOS is not known.
-A packet shorter than the base, from port 0 or the reflector's own, or
-over a rate limit is not answered: \-1, why in
+A packet shorter than the base, from port 0 or the reflector's own,
+over a rate limit, authenticated with no key that verifies it, or not
+authenticated to a reflector authenticated only, is not answered:
+\-1, why in
 .Fa *why
-.Pq Dv STAMP_DROP_SHORT , STAMP_DROP_PORT , STAMP_DROP_RATE ,
+.Pq Dv STAMP_DROP_SHORT , STAMP_DROP_PORT , STAMP_DROP_RATE , STAMP_DROP_AUTH , STAMP_DROP_UNAUTH ,
 counted.
 The caller sets the reply's own timestamp (T3) as late as it can with
+.Fn stamp_refl_finish ,
+which makes an authenticated reply's HMAC after it, and sends it;
 .Fn stamp_refl_send_time
-and sends it.
+sets an unauthenticated one's alone.
 .Fn stamp_refl_expire
 ends the sessions idle for
 .Va sess_idle ;
 .Fn stamp_refl_stats
-says the packets answered, those dropped by reason and the sessions.
+says the packets answered, those dropped by reason, those answered
+whose HMAC TLV was wrong
+.Pq Va tlv_failed
+and the sessions.
 .Ss The Session-Sender
 .Fn stamp_sender_new
 makes a sender of
@@ -630,8 +685,109 @@ the replies it sent less those received here on the way back
 .Pq Va dm_back_lost , No a late one among them ;
 a reply before one sent earlier is passed over, and counters that went
 back (the reflector started again) start the next part of the sum.
+With
+.Va key ,
+the sender's packets are of the authenticated mode under it (a copy):
+.Va auth_failed
+counts the replies passed over, not of that layout or whose HMAC is
+wrong (tampered with, or made under another key), their packets lost
+when their time comes;
+.Va tlv_failed
+those whose TLVs were not used, their HMAC TLV wrong or flagged
+.Dv STAMP_TLV_I
+by the reflector.
 .Fn stamp_mode_name
 names a mode.
+.Ss The authenticated mode
+A packet of the authenticated mode is
+.Dv STAMP_AUTH_LEN
+(112) octets of base, its fields apart with MBZ octets between them (RFC
+8762 sections 4.2.2 and 4.3.2, the SSID at octet 26 as RFC 8972 has
+it) and its last 16 an HMAC of the first 96: HMAC-SHA-256 truncated to
+128 bits
+.Pq Dv STAMP_HMAC_LEN .
+Nothing but TLVs may follow it, well-formed to the packet's end, and
+after them, Extra Padding aside, the HMAC TLV
+.Pq Dv STAMP_TLV_HMAC , No type 8
+over the Sequence Number and the TLVs before it; Extra Padding TLVs
+alone need none.
+A sender's padding is an Extra Padding TLV.
+A key
+.Pq Vt struct stamp_key : No its octets, 16 to 64, and the SSID it is for, or Dv STAMP_SSID_ANY
+is the session's.
+.Pp
+The reflector answers a request of that layout
+.Pf ( Fn stamp_auth_layout :
+112 octets or more, the twelve after the Sequence Number zero, where
+the unauthenticated layout has its timestamp) only when its HMAC
+verifies under a key of its SSID's or of any SSID's, the first that
+does; its reply is of the same layout under the same key.
+A request whose HMAC no key verifies, or after whose base come octets
+that are not well-formed TLVs to its end (left over, a header cut
+short, a length past the packet, a TLV of type 0), is dropped and
+counted
+.Pq Dv STAMP_DROP_AUTH ,
+never answered; one whose TLVs are well-formed but whose HMAC TLV is
+wrong, missing or out of its place is answered with its TLVs as they came, each flagged
+.Dv STAMP_TLV_I
+.Pq RFC 8972 section 4.8 ,
+the HMAC TLV made again.
+One whose MBZ was rewritten on the way no longer looks authenticated:
+it is answered as an unauthenticated request, unless
+.Va auth_only ,
+and the authenticated sender takes no such reply.
+Every HMAC is compared in constant time
+.Pq Xr CRYPTO_memcmp 3 .
+.Pp
+.Fn stamp_hmac
+is that HMAC of
+.Fa a
+then
+.Fa b
+.Pq Fa blen No 0: Fa a No alone
+into
+.Fa out ;
+.Fn stamp_auth_verify
+and
+.Fn stamp_auth_seal
+check and make a base packet's,
+.Fn stamp_auth_tlv_seal
+makes the HMAC TLV of a packet whose TLVs start at
+.Fa base ;
+.Fn stamp_auth_tlv_verify
+checks them, failing closed: 1 when the HMAC TLV is right, or nothing
+but Extra Padding TLVs (or nothing) follows the base; 0 when the TLVs
+are well-formed and their HMAC TLV wrong, missing or out of its place;
+\-1 when what follows the base is not well-formed TLVs to its end.
+Its walk is
+.Fn stamp_tlv_next Ns 's ,
+so the cores act on exactly what it checked.
+.Fn stamp_auth_ssid
+reads the SSID.
+.Fn stamp_auth_narrow
+moves a packet's fields, in place, where the unauthenticated layout has
+them, its TLVs after them, 68 octets shorter;
+.Fn stamp_auth_widen
+the reverse, its MBZ and HMAC zero;
+.Fa refl
+for a reflected packet's.
+.Fn stamp_auth_send_time
+sets a reflected packet's timestamp.
+.Pp
+.Fn stamp_keys_parse
+reads keys from text, a line each:
+.Dq Ar ssid key ,
+the SSID 0 to 65535 or
+.Ql *
+for any, the key 32 to 128 hexadecimal digits;
+.Ql #
+begins a comment.
+An error says the line's number, never a key.
+.Fn stamp_keys_read
+reads them from an open file, from its start: a regular file its owner
+alone may read and write, owned by root or by the process's user.
+.Fn stamp_keys_free
+zeroes the keys and frees them.
 .Ss Sockets
 .Fn stamp_socket
 opens a non-blocking UDP socket of family
@@ -703,6 +859,8 @@ return
 .Xr stamp 1 ,
 .Xr ntp_gettime 2 ,
 .Xr setfib 2 ,
+.Xr CRYPTO_memcmp 3 ,
+.Xr EVP_MAC 3 ,
 .Xr stampd 8
 .Rs
 .%R RFC 8762
@@ -713,6 +871,11 @@ return
 .%R RFC 8972
 .%T Simple Two-Way Active Measurement Protocol Optional Extensions
 .%D January 2021
+.Re
+.Rs
+.%R RFC 4231
+.%T Identifiers and Test Vectors for HMAC-SHA-224, HMAC-SHA-256, HMAC-SHA-384, and HMAC-SHA-512
+.%D December 2005
 .Re
 .Rs
 .%R RFC 4656

@@ -12,9 +12,9 @@ programs()
 	local s=$(atf_get_srcdir)
 
 	D=$s/../stampd
-	[ -x "$D" ] || D=$(atf_config_get stampd /usr/local/sbin/stampd)
+	[ -f "$D" ] && [ -x "$D" ] || D=$(atf_config_get stampd /usr/local/sbin/stampd)
 	S=$s/../../../usr.bin/stamp/stamp
-	[ -x "$S" ] || S=$(atf_config_get stamp /usr/local/bin/stamp)
+	[ -f "$S" ] && [ -x "$S" ] || S=$(atf_config_get stamp /usr/local/bin/stamp)
 	RC=$s/../../../etc/rc.d/stampd
 	[ -f "$RC" ] || RC=$(atf_config_get stampd_rc /usr/local/etc/rc.d/stampd)
 	# Run by root, it gives up root: to nobody, here.
@@ -30,12 +30,21 @@ port()
 }
 
 # stampd in the foreground with "$@", its log in d.out, until it says
-# it listens.
+# it listens; its keys an empty file of the case's unless -K says (the
+# host's stampd.keys is none of a test's).
 start()
 {
 	local i
 
 	programs
+	case " $* " in
+	*" -K "*)
+		;;
+	*)
+		(umask 077; : > none.keys)
+		set -- -K "$(pwd)/none.keys" "$@"
+		;;
+	esac
 	: > d.out
 	"$D" -d $U -P "$(pwd)/stampd.pid" "$@" > d.out 2>&1 &
 	echo $! > d.pid
@@ -624,6 +633,155 @@ dm_location_cleanup()
 	stop
 }
 
+# A key file, 0600: "ssid" and a random key; its name $1.
+keyfile()
+{
+	(umask 077; printf '%s %s\n' "$2" "$(openssl rand -hex 32)" > "$1")
+}
+
+atf_test_case auth cleanup
+auth_head()
+{
+	atf_set "descr" "The authenticated mode (RFC 8762 4.4, RFC 8972's" \
+	    "HMAC TLV): 112 octets answered under the key, the TLVs with" \
+	    "theirs; another key's dropped and counted; one octet flipped on" \
+	    "the way by a relay dropped and counted, never answered; the MBZ" \
+	    "flipped, answered as unauthenticated and the reply refused by the" \
+	    "sender; unauthenticated answered, unless -A"
+	atf_set "timeout" "60"
+}
+auth_body()
+{
+	local L
+
+	umask 077
+	L=$(atf_get_srcdir)/udplossy
+	keyfile k1 9
+	keyfile k2 9
+	P=$(port)
+	R=$(port)
+	start -p $P -r 0 -K "$(pwd)/k1"
+	atf_check -o match:'started: .*, 1 key, authenticated or not$' cat d.out
+	atf_check -o match:"^len=112 from=127\.0\.0\.1 seq=0 ssid=9 sseq=[0-9]+ ttl=[0-9]+ rttl=255 $LINE" \
+	    "$S" -p $P -K k1 127.0.0.1
+	atf_check -o match:"^len=212 .* $LINE.* ti=[a-z]+/sw,[a-z]+/sw cos=10/10/0/0 rdscp=10 dm=1/1/1/1 src=127\.0\.0\.1:[0-9]+ dst=127\.0\.0\.1:$P nat=none$" \
+	    "$S" -p $P -K k1 -T -D 10 -M -L 127.0.0.1
+	atf_check -o match:'^len=300 .* pad=ok ' "$S" -p $P -K k1 -T -l 300 \
+	    127.0.0.1
+	# Another key: no reply, and stampd says why.
+	atf_check -s exit:2 -o inline:'none\n' "$S" -p $P -K k2 -W 0.5 127.0.0.1
+	wait_match '1 requests failing authentication dropped' cat d.out ||
+	    atf_fail "not counted: $(cat d.out)"
+	# Not authenticated: answered, the reflector not only one.
+	atf_check -o match:'^len=44 ' "$S" -p $P 127.0.0.1
+	# One octet of the timestamp flipped on the way: never answered.
+	"$L" $R $P 0 0 0 20 > relay.out 2>&1 &
+	echo $! > relay.pid
+	wait_match '^ready$' cat relay.out || atf_fail "no relay"
+	atf_check -s exit:2 -o save:flip.out "$S" -p $R -K k1 -c 3 -i 0 \
+	    -W 0.5 127.0.0.1
+	atf_check -o inline:'3\n' grep -c '^none$' flip.out
+	atf_check -o match:'^sent=3 received=0 lost=3 ' cat flip.out
+	wait_match '4 requests failing authentication dropped' cat d.out ||
+	    atf_fail "not counted: $(cat d.out)"
+	kill "$(cat relay.pid)"
+	# Its MBZ flipped: no longer authenticated, answered as such; the
+	# sender takes no such reply.
+	"$L" $R $P 0 0 0 5 > relay.out 2>&1 &
+	echo $! > relay.pid
+	wait_match '^ready$' cat relay.out || atf_fail "no relay"
+	atf_check -s exit:2 -o save:mbz.out "$S" -p $R -K k1 -c 2 -i 0 \
+	    -W 0.5 127.0.0.1
+	atf_check -o match:'^sent=2 received=0 lost=2 ' \
+	    -o match:'^auth_failed=2 tlv_failed=0$' cat mbz.out
+	kill "$(cat relay.pid)"
+	rm relay.pid
+	stop
+	# Authenticated only: the others dropped, counted.
+	start -p $P -r 0 -K "$(pwd)/k1" -A
+	atf_check -o match:'started: .*, 1 key, authenticated only$' cat d.out
+	atf_check -s exit:2 -o inline:'none\n' "$S" -p $P -W 0.5 127.0.0.1
+	atf_check -o match:'^len=112 ' "$S" -p $P -K k1 127.0.0.1
+	wait_match '1 requests not authenticated dropped' cat d.out ||
+	    atf_fail "not counted: $(cat d.out)"
+	stop
+	# By the file: auth required.
+	echo 'auth required' > a.conf
+	start -p $P -r 0 -K "$(pwd)/k1" -f "$(pwd)/a.conf"
+	atf_check -o match:'authenticated only$' cat d.out
+	atf_check -s exit:2 -o inline:'none\n' "$S" -p $P -W 0.5 127.0.0.1
+	# No key is ever said.
+	atf_check -s exit:1 grep -F -e "$(cut -d' ' -f2 k1)" d.out
+}
+auth_cleanup()
+{
+	[ -f relay.pid ] && kill "$(cat relay.pid)" 2>/dev/null
+	stop
+}
+
+atf_test_case auth_keys cleanup
+auth_keys_head()
+{
+	atf_set "descr" "The key file: its owner's alone or no start; SIGHUP" \
+	    "reads it again through the descriptor kept, rewritten in place;" \
+	    "a file replaced is said, its keys kept; a key for any SSID; a" \
+	    "wrong line logged, the keys kept"
+	atf_set "timeout" "60"
+}
+auth_keys_body()
+{
+	umask 077
+	keyfile k1 9
+	keyfile k2 9
+	P=$(port)
+	programs
+	# Others may read it: no start; nor without it, -K said.
+	chmod 0640 k1
+	atf_check -s exit:1 -e match:'k1: mode 0640: others may read it' \
+	    "$D" -d -p $P -K "$(pwd)/k1"
+	chmod 0600 k1
+	atf_check -s exit:1 -e match:'nothere' "$D" -d -p $P -K "$(pwd)/nothere"
+	echo '9 abc' > bad
+	atf_check -s exit:1 -e match:'bad: line 1 is not' "$D" -d -p $P \
+	    -K "$(pwd)/bad"
+	# Rewritten in place, read on SIGHUP: the new key, not the old.
+	cp k1 keys
+	start -p $P -r 0 -K "$(pwd)/keys"
+	atf_check -o match:'^len=112 ' "$S" -p $P -K k1 127.0.0.1
+	cat k2 > keys
+	kill -HUP "$(cat d.pid)"
+	wait_match 'reloaded: .*, 1 key, ' cat d.out ||
+	    atf_fail "not reloaded: $(cat d.out)"
+	atf_check -o match:'^len=112 ' "$S" -p $P -K k2 127.0.0.1
+	atf_check -s exit:2 -o inline:'none\n' "$S" -p $P -K k1 -W 0.5 \
+	    127.0.0.1
+	# Both, and one for any SSID.
+	(cat k1; sed 's/^9/*/' k2) > keys
+	sed 's/^9/77/' k2 > k2_77
+	kill -HUP "$(cat d.pid)"
+	wait_match 'reloaded: .*, 2 keys, ' cat d.out ||
+	    atf_fail "not reloaded: $(cat d.out)"
+	atf_check -o match:'^len=112 .* ssid=9 ' "$S" -p $P -K k1 127.0.0.1
+	atf_check -o match:'^len=112 .* ssid=77 ' "$S" -p $P -K k2_77 127.0.0.1
+	# A wrong line: said, the keys as they were.
+	echo '9 zz' >> keys
+	kill -HUP "$(cat d.pid)"
+	wait_match 'keys: line 3 is not .*: the keys kept' cat d.out ||
+	    atf_fail "not refused: $(cat d.out)"
+	atf_check -o match:'^len=112 ' "$S" -p $P -K k1 127.0.0.1
+	# Replaced, not rewritten: said, the keys kept until a restart.
+	cp k2 keys.new
+	mv keys.new keys
+	kill -HUP "$(cat d.pid)"
+	wait_match 'keys was replaced, not rewritten' cat d.out ||
+	    atf_fail "not said: $(cat d.out)"
+	atf_check -o match:'^len=112 ' "$S" -p $P -K k1 127.0.0.1
+}
+auth_keys_cleanup()
+{
+	stop
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case stateless
@@ -637,4 +795,6 @@ atf_init_test_cases()
 	atf_add_test_case owd
 	atf_add_test_case cos
 	atf_add_test_case dm_location
+	atf_add_test_case auth
+	atf_add_test_case auth_keys
 }

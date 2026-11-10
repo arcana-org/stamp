@@ -11,10 +11,11 @@
 .Nd STAMP Session-Reflector
 .Sh SYNOPSIS
 .Nm
-.Op Fl d
+.Op Fl \&Ad
 .Op Fl C Ar source Ns Op : Ns Ar error
 .Op Fl D Ar dscps
 .Op Fl f Ar file
+.Op Fl K Ar keyfile
 .Op Fl m Cm stateless | stateful
 .Op Fl P Ar pidfile
 .Op Fl p Ar port
@@ -24,8 +25,8 @@
 .Sh DESCRIPTION
 .Nm
 is a Session-Reflector of the Simple Two-way Active Measurement
-Protocol (STAMP, RFC 8762), unauthenticated, with the Session-Sender
-Identifier of RFC 8972; it also answers a TWAMP Light Session-Sender
+Protocol (STAMP, RFC 8762), unauthenticated and authenticated, with
+the Session-Sender Identifier of RFC 8972; it also answers a TWAMP Light Session-Sender
 (RFC 5357 Appendix I) that pads its packets to 44 octets.
 It listens on UDP
 .Ar port
@@ -95,6 +96,19 @@ Nor is a packet from port 0 or from
 answered, nor one over the rate limits; those are dropped silently,
 their count logged when it has grown, every 5 seconds at most.
 .Pp
+In the authenticated mode (RFC 8762 section 4.4) a request is 112
+octets or more, its fields apart and an HMAC of its first 96 octets,
+HMAC-SHA-256 truncated to 128 bits, and RFC 8972's HMAC TLV after its
+other TLVs.
+It is answered, under the same key, only when its HMAC verifies under
+a key of the key file for its SSID, or for any SSID, and what follows
+its base is well-formed TLVs to its end; otherwise it is dropped,
+never answered, and the count of those is logged as the rate's is.
+A request whose HMAC TLV is wrong or missing is answered with its TLVs
+as they came, each flagged I (its integrity failed), none filled.
+A request not authenticated is answered as before, unless
+.Fl A .
+.Pp
 Bound,
 .Nm
 writes its pidfile and, run by root, gives up root: it changes its
@@ -106,6 +120,8 @@ and runs as
 .Pp
 The options are as follows:
 .Bl -tag -width "-r rate[/burst]"
+.It Fl A
+Answer only requests of the authenticated mode.
 .It Fl C Ar source Ns Op : Ns Ar error
 The clock as it is, for one that
 .Xr ntp_gettime 2
@@ -136,6 +152,14 @@ Without
 .Fl f ,
 .Pa /usr/local/etc/stampd.conf
 is read when it is there.
+.It Fl K Ar keyfile
+The key file; it must be there.
+Without
+.Fl K ,
+.Pa /usr/local/etc/stampd.keys
+is read when it is there.
+It is read before root is given up and kept open: see
+.Sx KEYS .
 .It Fl m Cm stateless | stateful
 .Cm stateless
 copies the sender's sequence number into the reply;
@@ -185,14 +209,50 @@ As
 Whether a Location TLV says the ports and addresses a request came
 with; default
 .Cm show .
+.It Cm auth Cm required | optional
+.Cm required
+as
+.Fl A ;
+default
+.Cm optional .
 .El
 .Pp
 What the command line sets is kept over the file's.
+.Sh KEYS
+The key file has a key a line,
+.Dq Ar ssid key :
+the SSID of the sessions it is for, 0 to 65535, or
+.Ql *
+for any, and the key, 32 to 128 hexadecimal digits (16 to 64 octets);
+.Ql #
+starts a comment.
+A request's key is the first of its SSID's, or of any SSID's, under
+which its HMAC verifies.
+The file must be a regular file its owner alone may read and write
+(mode 0600 at most), owned by root (or by the user that runs
+.Nm
+unprivileged); otherwise
+.Nm
+does not start.
+No key is ever logged; an error says the line's number.
+.Pp
+It is opened and read before root is given up, and kept open:
+.Dv SIGHUP
+reads it again through that descriptor, so it is to be rewritten in
+place (truncated and written, as the shell's
+.Ql >
+does), not replaced by another file, which a reload cannot open once
+root is given up.
+A file replaced, or one that cannot be read or has an error, is logged
+and the keys kept as they were; a restart reads it.
+A key file made while
+.Nm
+runs without one is read when it is started again.
 .Sh SIGNALS
 .Bl -tag -width SIGTERM
 .It Dv SIGHUP
-Read the configuration file again; its sessions are kept unless it
-becomes stateless.
+Read the configuration file and the key file again; its sessions are
+kept unless it becomes stateless.
 A file that cannot be read, or has an error, is logged and the
 configuration kept.
 .It Dv SIGTERM , SIGINT
@@ -242,6 +302,8 @@ for each FIB's own.
 .Bl -tag -width /usr/local/etc/stampd.conf -compact
 .It Pa /usr/local/etc/stampd.conf
 The configuration file.
+.It Pa /usr/local/etc/stampd.keys
+The key file.
 .It Pa /var/run/stampd/
 The pidfiles of the instances the
 .Xr rc 8
@@ -280,7 +342,11 @@ setfib 2 stampd -d -m stateless
 .Sh AUTHORS
 .An Pouria Mousavizadeh Tehrani Aq Mt pouria@FreeBSD.org
 .Sh CAVEATS
-The authenticated mode is not implemented.
+A request whose MBZ octets after its Sequence Number were rewritten on
+the way no longer looks authenticated: it is answered as an
+unauthenticated one, unless
+.Fl A ,
+and an authenticated sender takes no such reply.
 The user
 .Ql _stampd
 is made by the package; built from the sources, make it with

@@ -16,6 +16,7 @@
 .Op Fl c Ar count
 .Op Fl D Ar dscp Ns Op / Ns Ar reply
 .Op Fl i Ar interval
+.Op Fl K Ar keyfile
 .Op Fl l Ar length
 .Op Fl m Cm stateless | stateful
 .Op Fl p Ar port
@@ -82,8 +83,29 @@ Information TLV with
 8 octets more.
 .It Fl i Ar interval
 Seconds from one packet to the next; default 1.
+.It Fl K Ar keyfile
+Send in the authenticated mode (RFC 8762 section 4.4): the base 112
+octets, its fields apart and its HMAC (HMAC-SHA-256 truncated to 128
+bits) after them, and the HMAC TLV of RFC 8972 section 4.8 after the
+other TLVs, 20 octets more with any of them.
+The key is one of
+.Ar keyfile ,
+in
+.Xr stampd 8 Ns 's
+format, a file its owner alone may read: the first of the SSID
+.Fl s
+says, or for any SSID; without
+.Fl s ,
+the first, and its SSID.
+A reply not authenticated, or whose HMAC is wrong, is no reply (its
+packet lost in time); one whose HMAC TLV is wrong, or whose TLVs the
+reflector flagged I, has its TLVs passed over; a last line says how
+many of each,
+.Ql auth_failed= Ns Ar n Ql tlv_failed= Ns Ar m ,
+when there were any.
 .It Fl l Ar length
-The packet's length; default 44, the base.
+The packet's length; default 44, the base (112 with
+.Fl K ) .
 A longer one is padded with a pattern, which must come back; a shorter
 one is no STAMP packet (a TWAMP Light sender's bare 14 octets) and
 must not be answered.

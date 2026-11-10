@@ -6,6 +6,7 @@
 
 #include <sys/param.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -13,6 +14,8 @@
 #include <atf-c.h>
 #include <errno.h>
 #include <string.h>
+#include <strings.h>
+#include <unistd.h>
 
 #include "stamp.h"
 
@@ -1319,8 +1322,521 @@ ATF_TC_BODY(tlv_location, tc)
 	stamp_sender_free(s);
 }
 
+/* ---- The authenticated mode ------------------------------------- */
+
+/* A key of SSID ssid (STAMP_SSID_ANY: any), its octets from seed. */
+static struct stamp_key
+key_make(int32_t ssid, uint8_t seed)
+{
+	struct stamp_key	k;
+	size_t			i;
+
+	memset(&k, 0, sizeof(k));
+	k.ssid = ssid;
+	k.len = 32;
+	for (i = 0; i < k.len; i++)
+		k.key[i] = (uint8_t)(seed + i * 13);
+	return (k);
+}
+
+/*
+ * A packet of the sender's of want octets at mono into p (*plen its
+ * length), reflected by r into out: the reply's length, finished, or
+ * -1 and *why; 0 without r.
+ */
+static ssize_t
+auth_send(struct stamp_sender *s, struct stamp_refl *r, double mono,
+    size_t want, uint8_t *p, size_t *plen, uint8_t *out, enum stamp_drop *why)
+{
+	struct sockaddr_in	 a = sin4("192.0.2.1", 40000);
+	struct sockaddr_in	 l = sin4("192.0.2.2", 862);
+	struct stamp_sample	 sm;
+	struct stamp_rx		 rx;
+	struct timespec		 t1;
+	ssize_t			 n;
+
+	t1.tv_sec = 1778400000 + (time_t)mono;
+	t1.tv_nsec = 0;
+	*plen = stamp_sender_len(s, want);
+	ATF_REQUIRE(stamp_sender_packet(s, p, *plen, &t1, mono, &sm) != -1);
+	if (r == NULL)
+		return (0);
+	memset(&rx, 0, sizeof(rx));
+	rx.pkt = p;
+	rx.len = *plen;
+	rx.peer = (struct sockaddr *)&a;
+	rx.local = (struct sockaddr *)&l;
+	rx.ttl = 64;
+	rx.tos = 46 << 2;
+	rx.t2 = t1;
+	rx.mono = mono;
+	n = stamp_refl_reply(r, &rx, out, STAMP_PKT_MAX, why);
+	if (n > 0) {
+		t1.tv_nsec = 1000000;	/* T3 a millisecond after T2 */
+		ATF_REQUIRE(stamp_refl_finish(r, out, (size_t)n, &t1) == 0);
+	}
+	return (n);
+}
+
+ATF_TC_WITHOUT_HEAD(auth_layout);
+ATF_TC_BODY(auth_layout, tc)
+{
+	uint8_t	a[STAMP_AUTH_LEN + 8], b[STAMP_AUTH_LEN + 8];
+	size_t	i;
+
+	/* A reflected packet: its fields where RFC 8762 4.3.2 has them. */
+	for (i = 0; i < sizeof(a); i++)
+		a[i] = (uint8_t)(i + 1);
+	stamp_auth_widen(a, STAMP_UNAUTH_LEN + 8, true);
+	ATF_CHECK(a[0] == 1 && a[3] == 4);		/* sequence */
+	ATF_CHECK(a[16] == 5 && a[23] == 12);		/* timestamp */
+	ATF_CHECK(a[24] == 13 && a[25] == 14);		/* error estimate */
+	ATF_CHECK(a[26] == 15 && a[27] == 16);		/* SSID */
+	ATF_CHECK(a[32] == 17 && a[39] == 24);		/* receive timestamp */
+	ATF_CHECK(a[48] == 25 && a[51] == 28);		/* sender's sequence */
+	ATF_CHECK(a[64] == 29 && a[71] == 36);		/* its timestamp */
+	ATF_CHECK(a[72] == 37 && a[73] == 38);		/* its error estimate */
+	ATF_CHECK(a[80] == 41);				/* its TTL */
+	ATF_CHECK(a[4] == 0 && a[15] == 0 && a[28] == 0 && a[40] == 0 &&
+	    a[52] == 0 && a[74] == 0 && a[81] == 0 && a[95] == 0);
+	ATF_CHECK(a[96] == 0 && a[111] == 0);		/* the HMAC, zero */
+	ATF_CHECK(a[112] == 45 && a[119] == 52);	/* what follows */
+	ATF_CHECK(stamp_auth_layout(a, sizeof(a)));
+	ATF_CHECK(!stamp_auth_layout(a, STAMP_AUTH_LEN - 1));
+	ATF_CHECK_EQ(stamp_auth_ssid(a), 15 << 8 | 16);
+	stamp_auth_narrow(a, sizeof(a), true);
+	for (i = 0; i < STAMP_UNAUTH_LEN + 8; i++)
+		if (i == 38 || i == 39 || (i >= 41 && i < 44))
+			ATF_CHECK_EQ_MSG(a[i], 0, "MBZ %zu", i);
+		else
+			ATF_CHECK_EQ_MSG(a[i], (uint8_t)(i + 1), "%zu", i);
+	/* A sender's: no reflector's fields. */
+	for (i = 0; i < sizeof(b); i++)
+		b[i] = (uint8_t)(i + 1);
+	stamp_auth_widen(b, STAMP_UNAUTH_LEN, false);
+	ATF_CHECK(b[26] == 15 && b[32] == 0 && b[48] == 0 && b[80] == 0);
+	/* The unauthenticated layout is not taken for it. */
+	memset(a, 0, sizeof(a));
+	pkt_make(a, STAMP_AUTH_LEN, 1, 1);
+	ATF_CHECK(!stamp_auth_layout(a, STAMP_AUTH_LEN));
+}
+
+ATF_TC_WITHOUT_HEAD(auth_hmac);
+ATF_TC_BODY(auth_hmac, tc)
+{
+	/* RFC 4231 test case 2, HMAC-SHA-256 truncated to 128 bits. */
+	static const uint8_t	 want[16] = { 0x5b, 0xdc, 0xc1, 0x46, 0xbf,
+	    0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7 };
+	struct stamp_key	 k;
+	uint8_t			 h[STAMP_HMAC_LEN];
+
+	memset(&k, 0, sizeof(k));
+	memcpy(k.key, "Jefe", 4);
+	k.len = 4;
+	ATF_REQUIRE(stamp_hmac(&k, (const uint8_t *)"what do ya want ", 16,
+	    (const uint8_t *)"for nothing?", 12, h) == 0);
+	ATF_CHECK(memcmp(h, want, sizeof(h)) == 0);
+}
+
+ATF_TC_WITHOUT_HEAD(auth_round_trip);
+ATF_TC_BODY(auth_round_trip, tc)
+{
+	struct stamp_key	  k = key_make(7, 1);
+	struct stamp_sender_conf  c = { .ssid = 7, .timeout = 1, .key = &k,
+	    .tsinfo = true, .cos = true, .dscp = 10, .dm = true,
+	    .location = true };
+	struct stamp_refl_conf	  rc = { .stateful = true, .port = 862,
+	    .keys = &k, .nkeys = 1 };
+	struct stamp_sender	 *s;
+	struct stamp_refl	 *r;
+	struct stamp_sender_stats st;
+	struct stamp_refl_stats	  rs;
+	struct stamp_sample	  sm;
+	uint8_t			  p[STAMP_PKT_MAX], out[STAMP_PKT_MAX];
+	size_t			  plen;
+	ssize_t			  n;
+
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	/* The keys are copies: the caller's may go. */
+	explicit_bzero(&k, sizeof(k));
+	/* The base, its TLVs and the HMAC TLV: 112 + 8 + 8 + 16 + 48 + 20. */
+	ATF_CHECK_EQ(stamp_sender_len(s, 0), 212);
+	ATF_CHECK_EQ(stamp_sender_len(s, 215), 216);
+	ATF_REQUIRE((n = auth_send(s, r, 10, 300, p, &plen, out, NULL)) ==
+	    300);
+	ATF_CHECK(stamp_auth_layout(p, plen));
+	ATF_CHECK(p[212 - 20 + 1] == STAMP_TLV_HMAC);
+	ATF_CHECK(p[212 + 1] == STAMP_TLV_PAD);
+	ATF_REQUIRE(stamp_sender_reply(s, out, (size_t)n, 10.004, NULL, &sm) ==
+	    1);
+	ATF_CHECK_EQ(sm.r.seq, 0);
+	ATF_CHECK_EQ(sm.r.ssid, 7);
+	ATF_CHECK_EQ(sm.r.sttl, 64);
+	ATF_CHECK(sm.r.mbz_ok);
+	ATF_CHECK_MSG(sm.rtt > 0.0029 && sm.rtt < 0.0031, "rtt %g", sm.rtt);
+	ATF_CHECK(sm.has_tsinfo);
+	ATF_CHECK(sm.has_cos && sm.cos.dscp1 == 10 && sm.cos.dscp2 == 46);
+	ATF_CHECK(sm.has_dm && sm.dm.s_tx == 1 && sm.dm.r_rx == 1);
+	ATF_CHECK(sm.has_loc && sm.loc.src.ss_family == AF_INET);
+	/* Again, stateful: the reflector's count. */
+	ATF_REQUIRE((n = auth_send(s, r, 11, 0, p, &plen, out, NULL)) == 212);
+	ATF_REQUIRE(stamp_sender_reply(s, out, (size_t)n, 11.002, NULL, &sm) ==
+	    1);
+	ATF_CHECK_EQ(sm.r.seq, 1);
+	ATF_CHECK(sm.has_dm && sm.dm.r_rx == 2);
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.received, 2);
+	ATF_CHECK_EQ(st.auth_failed, 0);
+	ATF_CHECK_EQ(st.tlv_failed, 0);
+	stamp_refl_stats(r, &rs);
+	ATF_CHECK_EQ(rs.answered, 2);
+	ATF_CHECK_EQ(rs.dropped[STAMP_DROP_AUTH], 0);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+}
+
+ATF_TC_WITHOUT_HEAD(auth_tamper);
+ATF_TC_BODY(auth_tamper, tc)
+{
+	struct stamp_key	  k = key_make(7, 1);
+	struct stamp_sender_conf  c = { .ssid = 7, .timeout = 1, .key = &k,
+	    .tsinfo = true, .cos = true, .dscp = 10 };
+	struct stamp_refl_conf	  rc = { .stateful = false, .port = 862,
+	    .keys = &k, .nkeys = 1 };
+	struct stamp_sender	 *s;
+	struct stamp_refl	 *r;
+	struct stamp_sender_stats st;
+	struct stamp_refl_stats	  rs;
+	struct stamp_sample	  sm;
+	struct stamp_rx		  rx;
+	struct sockaddr_in	  a = sin4("192.0.2.1", 40000);
+	struct timespec		  t1 = { 1778400000, 0 };
+	enum stamp_drop		  why;
+	uint8_t			  p[STAMP_PKT_MAX], q[STAMP_PKT_MAX];
+	uint8_t			  out[STAMP_PKT_MAX];
+	size_t			  plen, i, dropped = 0;
+	ssize_t			  n;
+
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	plen = stamp_sender_len(s, 0);
+	ATF_REQUIRE_EQ(plen, 112 + 8 + 8 + 20);
+	ATF_REQUIRE(stamp_sender_packet(s, p, plen, &t1, 1, &sm) == 0);
+	memset(&rx, 0, sizeof(rx));
+	rx.peer = (struct sockaddr *)&a;
+	rx.t2 = t1;
+	rx.mono = 1;
+	rx.len = plen;
+	rx.pkt = q;
+	/*
+	 * One bit of the base flipped, anywhere its HMAC covers or in the
+	 * HMAC: dropped, never answered.  (Flipped in the MBZ after the
+	 * Sequence Number, it no longer looks authenticated: answered as
+	 * unauthenticated, which the sender takes for no reply, below.)
+	 */
+	for (i = 0; i < STAMP_AUTH_LEN; i++) {
+		if (i >= 4 && i < 16)
+			continue;
+		memcpy(q, p, plen);
+		q[i] ^= 0x01;
+		ATF_CHECK_EQ_MSG(stamp_refl_reply(r, &rx, out, STAMP_PKT_MAX,
+		    &why), -1, "octet %zu", i);
+		ATF_CHECK_EQ_MSG(why, STAMP_DROP_AUTH, "octet %zu", i);
+		dropped++;
+	}
+	stamp_refl_stats(r, &rs);
+	ATF_CHECK_EQ(rs.dropped[STAMP_DROP_AUTH], dropped);
+	ATF_CHECK_EQ(rs.answered, 0);
+	/* One of a TLV's (the Class of Service TLV's DSCP1): answered, its
+	 * TLVs untouched and flagged I, the HMAC TLV made again. */
+	memcpy(q, p, plen);
+	q[112 + 8 + 4] ^= 0x04;
+	ATF_REQUIRE((n = stamp_refl_reply(r, &rx, out, STAMP_PKT_MAX, &why)) ==
+	    (ssize_t)plen);
+	ATF_REQUIRE(stamp_refl_finish(r, out, (size_t)n, &t1) == 0);
+	ATF_CHECK(out[112] & STAMP_TLV_I);
+	ATF_CHECK(out[120] & STAMP_TLV_I);
+	ATF_CHECK(out[128] & STAMP_TLV_I);
+	ATF_CHECK_EQ(out[112 + 4], 0);		/* not filled */
+	stamp_refl_stats(r, &rs);
+	ATF_CHECK_EQ(rs.tlv_failed, 1);
+	ATF_REQUIRE(stamp_sender_reply(s, out, (size_t)n, 1.001, NULL, &sm) ==
+	    1);
+	ATF_CHECK(!sm.has_tsinfo && !sm.has_cos);
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.tlv_failed, 1);
+	/* The HMAC TLV's own octet: the same. */
+	ATF_REQUIRE(stamp_sender_packet(s, p, plen, &t1, 2, &sm) == 0);
+	memcpy(q, p, plen);
+	q[plen - 1] ^= 0x80;
+	rx.mono = 2;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, STAMP_PKT_MAX, &why) ==
+	    (ssize_t)plen);
+	ATF_CHECK(out[112] & STAMP_TLV_I);
+	/* A reply tampered with on the way back: no reply. */
+	ATF_REQUIRE(stamp_sender_packet(s, p, plen, &t1, 3, &sm) == 0);
+	rx.pkt = p;
+	rx.mono = 3;
+	ATF_REQUIRE((n = stamp_refl_reply(r, &rx, out, STAMP_PKT_MAX, &why)) ==
+	    (ssize_t)plen);
+	ATF_REQUIRE(stamp_refl_finish(r, out, (size_t)n, &t1) == 0);
+	memcpy(q, out, plen);
+	q[34] ^= 0x10;				/* its receive timestamp */
+	ATF_CHECK(stamp_sender_reply(s, q, (size_t)n, 3.001, NULL, &sm) == 0);
+	/* Its MBZ rewritten: not authenticated, no reply either. */
+	memcpy(q, out, plen);
+	q[5] = 1;
+	ATF_CHECK(stamp_sender_reply(s, q, (size_t)n, 3.001, NULL, &sm) == 0);
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.auth_failed, 2);
+	/* The reply as it was made: taken. */
+	ATF_CHECK(stamp_sender_reply(s, out, (size_t)n, 3.002, NULL, &sm) == 1);
+	/* The packet whose reply did not come: lost in time. */
+	ATF_CHECK(stamp_sender_expire(s, 10, &sm) == 1);
+	ATF_CHECK(sm.lost);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+}
+
+/*
+ * What follows an authenticated base: well-formed TLVs to its end, the
+ * HMAC TLV over them, or nothing (or Extra Padding TLVs alone); never
+ * octets the HMACs do not cover.
+ */
+ATF_TC_WITHOUT_HEAD(auth_tlv_strict);
+ATF_TC_BODY(auth_tlv_strict, tc)
+{
+	static const struct {
+		const char	*what;
+		uint8_t		 tail[24];
+		size_t		 len;
+		int		 verify;	/* stamp_auth_tlv_verify() */
+	} cases[] = {
+	    { "nothing", { 0 }, 0, 1 },
+	    { "trailing octets", { 0x5a, 0x5a, 0x5a }, 3, -1 },
+	    { "a header cut short", { 0, STAMP_TLV_PAD }, 2, -1 },
+	    { "a TLV of type 0", { 0, 0, 0, 0 }, 4, -1 },
+	    { "a length overlong", { 0, STAMP_TLV_PAD, 0, 100, 1, 2, 3, 4 }, 8,
+	      -1 },
+	    { "Extra Padding after its end", { 0, STAMP_TLV_PAD, 0, 2, 1, 2, 9 },
+	      7, -1 },
+	    { "a TLV and no HMAC TLV", { 0, STAMP_TLV_TSINFO, 0, 4, 0, 0, 0, 0 },
+	      8, 0 },
+	    { "Extra Padding alone", { 0, STAMP_TLV_PAD, 0, 4, 1, 2, 3, 4, 0,
+	      STAMP_TLV_PAD, 0, 0 }, 12, 1 },
+	};
+	struct stamp_key	  k = key_make(7, 1);
+	struct stamp_sender_conf  c = { .ssid = 7, .timeout = 1, .key = &k };
+	struct stamp_refl_conf	  rc = { .port = 862, .keys = &k, .nkeys = 1 };
+	struct stamp_sender	 *s;
+	struct stamp_refl	 *r;
+	struct stamp_refl_stats	  rs;
+	struct stamp_sender_stats st;
+	struct stamp_sample	  sm;
+	struct stamp_rx		  rx;
+	struct sockaddr_in	  a = sin4("192.0.2.1", 40000);
+	struct timespec		  t1 = { 1778400000, 0 };
+	enum stamp_drop		  why;
+	uint8_t			  p[STAMP_PKT_MAX], q[STAMP_PKT_MAX];
+	uint8_t			  out[STAMP_PKT_MAX];
+	size_t			  i, drops = 0;
+	ssize_t			  n;
+
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	/* The padding of an authenticated packet is a TLV, always. */
+	ATF_CHECK_EQ(stamp_sender_len(s, 0), STAMP_AUTH_LEN);
+	ATF_CHECK_EQ(stamp_sender_len(s, 114), 116);
+	ATF_REQUIRE(stamp_sender_packet(s, p, 120, &t1, 1, &sm) == 0);
+	ATF_CHECK(p[113] == STAMP_TLV_PAD && p[115] == 4);
+	ATF_CHECK_EQ(stamp_auth_tlv_verify(&k, p, 120, STAMP_AUTH_LEN), 1);
+	memset(&rx, 0, sizeof(rx));
+	rx.peer = (struct sockaddr *)&a;
+	rx.t2 = t1;
+	rx.mono = 1;
+	rx.pkt = q;
+	for (i = 0; i < nitems(cases); i++) {
+		/* The base sealed as the sender sealed it; the tail after. */
+		memcpy(q, p, STAMP_AUTH_LEN);
+		memcpy(q + STAMP_AUTH_LEN, cases[i].tail, cases[i].len);
+		rx.len = STAMP_AUTH_LEN + cases[i].len;
+		ATF_CHECK_EQ_MSG(stamp_auth_tlv_verify(&k, q, rx.len,
+		    STAMP_AUTH_LEN), cases[i].verify, "%s", cases[i].what);
+		n = stamp_refl_reply(r, &rx, out, STAMP_PKT_MAX, &why);
+		if (cases[i].verify == -1) {
+			ATF_CHECK_EQ_MSG(n, -1, "%s", cases[i].what);
+			ATF_CHECK_EQ_MSG(why, STAMP_DROP_AUTH, "%s",
+			    cases[i].what);
+			drops++;
+			continue;
+		}
+		ATF_CHECK_EQ_MSG(n, (ssize_t)rx.len, "%s", cases[i].what);
+		/* A TLV without the HMAC TLV: answered, flagged I. */
+		if (cases[i].verify == 0)
+			ATF_CHECK_MSG(out[STAMP_AUTH_LEN] & STAMP_TLV_I, "%s",
+			    cases[i].what);
+		else if (cases[i].len > 0)
+			ATF_CHECK_MSG(!(out[STAMP_AUTH_LEN] & STAMP_TLV_I), "%s",
+			    cases[i].what);
+	}
+	stamp_refl_stats(r, &rs);
+	ATF_CHECK_EQ(rs.dropped[STAMP_DROP_AUTH], drops);
+	ATF_CHECK_EQ(rs.tlv_failed, 1);
+	ATF_CHECK_EQ(rs.answered, 3);
+	/* A reply with octets after its base that are no TLVs: the base
+	 * alone used, said. */
+	ATF_REQUIRE(stamp_sender_packet(s, p, STAMP_AUTH_LEN, &t1, 2, &sm) == 0);
+	rx.pkt = p;
+	rx.len = STAMP_AUTH_LEN;
+	rx.mono = 2;
+	ATF_REQUIRE((n = stamp_refl_reply(r, &rx, out, STAMP_PKT_MAX, &why)) ==
+	    STAMP_AUTH_LEN);
+	ATF_REQUIRE(stamp_refl_finish(r, out, (size_t)n, &t1) == 0);
+	out[STAMP_AUTH_LEN] = 0x5a;
+	out[STAMP_AUTH_LEN + 1] = 0x5a;
+	ATF_CHECK(stamp_sender_reply(s, out, STAMP_AUTH_LEN + 2, 2.001, NULL,
+	    &sm) == 1);
+	ATF_CHECK(!sm.has_tsinfo && !sm.has_cos && !sm.has_dm && !sm.has_loc);
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.tlv_failed, 1);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+}
+
+ATF_TC_WITHOUT_HEAD(auth_keys);
+ATF_TC_BODY(auth_keys, tc)
+{
+	struct stamp_key	  k = key_make(7, 1), other = key_make(7, 2);
+	struct stamp_key	  two[2], any = key_make(STAMP_SSID_ANY, 1);
+	struct stamp_key	  wrong_ssid = key_make(8, 1);
+	struct stamp_sender_conf  c = { .ssid = 7, .timeout = 1, .key = &k };
+	struct stamp_sender_conf  u = { .ssid = 7, .timeout = 1 };
+	struct stamp_refl_conf	  rc = { .port = 862 };
+	struct stamp_sender	 *s, *su;
+	struct stamp_refl	 *r;
+	struct stamp_refl_stats	  rs;
+	struct stamp_sender_stats st;
+	struct stamp_sample	  sm;
+	enum stamp_drop		  why;
+	uint8_t			  p[STAMP_PKT_MAX], out[STAMP_PKT_MAX];
+	size_t			  plen;
+	ssize_t			  n;
+
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_REQUIRE((su = stamp_sender_new(&u)) != NULL);
+	/* No keys: an authenticated request dropped; one not, answered,
+	 * and its reply no reply to the authenticated sender. */
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	ATF_CHECK(auth_send(s, r, 1, 0, p, &plen, out, &why) == -1);
+	ATF_CHECK_EQ(why, STAMP_DROP_AUTH);
+	ATF_CHECK((n = auth_send(su, r, 1, 0, p, &plen, out, &why)) == 44);
+	ATF_CHECK(stamp_sender_reply(s, out, (size_t)n, 1.001, NULL, &sm) == 0);
+	stamp_sender_stats(s, &st);
+	ATF_CHECK_EQ(st.auth_failed, 1);
+	/* Another key of the SSID: dropped. */
+	rc.keys = &other;
+	rc.nkeys = 1;
+	ATF_REQUIRE(stamp_refl_setconf(r, &rc) == 0);
+	ATF_CHECK(auth_send(s, r, 2, 0, p, &plen, out, &why) == -1);
+	ATF_CHECK_EQ(why, STAMP_DROP_AUTH);
+	/* The key, but another SSID's: dropped. */
+	rc.keys = &wrong_ssid;
+	ATF_REQUIRE(stamp_refl_setconf(r, &rc) == 0);
+	ATF_CHECK(auth_send(s, r, 3, 0, p, &plen, out, &why) == -1);
+	/* Two of the SSID, the right one second; any SSID's: answered. */
+	two[0] = other;
+	two[1] = k;
+	rc.keys = two;
+	rc.nkeys = 2;
+	ATF_REQUIRE(stamp_refl_setconf(r, &rc) == 0);
+	ATF_REQUIRE((n = auth_send(s, r, 4, 0, p, &plen, out, &why)) == 112);
+	ATF_CHECK(stamp_sender_reply(s, out, (size_t)n, 4.001, NULL, &sm) == 1);
+	rc.keys = &any;
+	rc.nkeys = 1;
+	ATF_REQUIRE(stamp_refl_setconf(r, &rc) == 0);
+	ATF_REQUIRE((n = auth_send(s, r, 5, 0, p, &plen, out, &why)) == 112);
+	ATF_CHECK(stamp_sender_reply(s, out, (size_t)n, 5.001, NULL, &sm) == 1);
+	/* Unauthenticated, to one authenticated only: dropped. */
+	ATF_CHECK(auth_send(su, r, 6, 0, p, &plen, out, &why) == 44);
+	rc.auth_only = true;
+	ATF_REQUIRE(stamp_refl_setconf(r, &rc) == 0);
+	ATF_CHECK(auth_send(su, r, 7, 0, p, &plen, out, &why) == -1);
+	ATF_CHECK_EQ(why, STAMP_DROP_UNAUTH);
+	ATF_CHECK(auth_send(s, r, 8, 0, p, &plen, out, &why) == 112);
+	stamp_refl_stats(r, &rs);
+	ATF_CHECK_EQ(rs.dropped[STAMP_DROP_AUTH], 3);
+	ATF_CHECK_EQ(rs.dropped[STAMP_DROP_UNAUTH], 1);
+	stamp_sender_free(s);
+	stamp_sender_free(su);
+	stamp_refl_free(r);
+}
+
+ATF_TC_WITHOUT_HEAD(auth_keyfile);
+ATF_TC_BODY(auth_keyfile, tc)
+{
+	static const char	 good[] =
+	    "# a comment\n"
+	    "7 000102030405060708090a0b0c0d0e0f\n"
+	    "\n"
+	    "  * 00112233445566778899AABBCCDDEEFF"
+	    "00112233445566778899aabbccddeeff  # any\n"
+	    "65535 ffffffffffffffffffffffffffffffff";
+	static const char *const bad[] = {
+	    "7 0001020304050607",			/* short */
+	    "7 000102030405060708090a0b0c0d0e0",	/* odd */
+	    "70000 000102030405060708090a0b0c0d0e0f",	/* the SSID */
+	    "-1 000102030405060708090a0b0c0d0e0f",
+	    "7 000102030405060708090a0b0c0d0e0g",	/* not hex */
+	    "7 000102030405060708090a0b0c0d0e0f extra",
+	    "7",
+	};
+	struct stamp_key	*k;
+	size_t			 n, i;
+	char			 why[256], path[] = "keys.XXXXXX";
+	int			 fd;
+
+	ATF_REQUIRE(stamp_keys_parse(good, strlen(good), &k, &n, why,
+	    sizeof(why)) == 0);
+	ATF_REQUIRE_EQ(n, 3);
+	ATF_CHECK(k[0].ssid == 7 && k[0].len == 16 && k[0].key[15] == 0x0f);
+	ATF_CHECK(k[1].ssid == STAMP_SSID_ANY && k[1].len == 32 &&
+	    k[1].key[9] == 0x99 && k[1].key[10] == 0xaa);
+	ATF_CHECK(k[2].ssid == 65535);
+	stamp_keys_free(k, n);
+	for (i = 0; i < nitems(bad); i++) {
+		ATF_CHECK_MSG(stamp_keys_parse(bad[i], strlen(bad[i]), &k, &n,
+		    why, sizeof(why)) == -1, "%zu", i);
+		/* Its line said, never the key. */
+		ATF_CHECK_MSG(strstr(why, "line 1") != NULL && strstr(why,
+		    "0001") == NULL, "%zu: %s", i, why);
+	}
+	ATF_CHECK(stamp_keys_parse("", 0, &k, &n, why, sizeof(why)) == 0 &&
+	    n == 0 && k == NULL);
+	/* A file others may read: refused. */
+	ATF_REQUIRE((fd = mkstemp(path)) != -1);
+	ATF_REQUIRE(write(fd, good, strlen(good)) == (ssize_t)strlen(good));
+	ATF_REQUIRE(fchmod(fd, 0600) == 0);
+	ATF_REQUIRE(stamp_keys_read(fd, &k, &n, why, sizeof(why)) == 0);
+	ATF_CHECK_EQ(n, 3);
+	stamp_keys_free(k, n);
+	ATF_REQUIRE(fchmod(fd, 0640) == 0);
+	ATF_CHECK(stamp_keys_read(fd, &k, &n, why, sizeof(why)) == -1);
+	ATF_CHECK_MSG(strstr(why, "0640") != NULL, "%s", why);
+	close(fd);
+	unlink(path);
+}
+
 ATF_TP_ADD_TCS(tp)
 {
+
+	ATF_TP_ADD_TC(tp, auth_layout);
+	ATF_TP_ADD_TC(tp, auth_hmac);
+	ATF_TP_ADD_TC(tp, auth_round_trip);
+	ATF_TP_ADD_TC(tp, auth_tamper);
+	ATF_TP_ADD_TC(tp, auth_tlv_strict);
+	ATF_TP_ADD_TC(tp, auth_keys);
+	ATF_TP_ADD_TC(tp, auth_keyfile);
 
 	ATF_TP_ADD_TC(tp, tlv_cos);
 	ATF_TP_ADD_TC(tp, tlv_dm);

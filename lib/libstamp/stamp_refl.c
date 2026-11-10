@@ -5,8 +5,8 @@
  */
 
 /*
- * The Session-Reflector's core (RFC 8762 4.3), unauthenticated, with
- * the Session-Sender Identifier of RFC 8972 3; it answers a TWAMP
+ * The Session-Reflector's core (RFC 8762 4.3), with the Session-Sender
+ * Identifier of RFC 8972 3, in both modes; it answers a TWAMP
  * Light Session-Sender (RFC 5357 Appendix I) that pads its packets to
  * 44 octets or more, the offsets being the same.  No socket here: a
  * packet as it came (struct stamp_rx) in, the reply out.
@@ -33,6 +33,23 @@
  * than one more: the sources' buckets a table of RL_SLOTS, RL_WAYS a
  * set, its hash keyed by a random secret so that no sender chooses
  * whom it displaces, a new source taking the set's oldest.
+ *
+ * The authenticated mode (RFC 8762 4.4): a request of its layout
+ * (stamp_auth_layout()) is answered only when its HMAC verifies under a
+ * key of the reflector's for its SSID, or for any SSID, the first that
+ * does; otherwise it is dropped and counted (STAMP_DROP_AUTH), never
+ * answered.  Its reply is of the same layout under the same key, its
+ * HMAC made by stamp_refl_finish() once T3 is in.  What follows its
+ * base must be well-formed TLVs to its end (no octets left over, no
+ * header cut short, no length overlong, none of type 0), else it is
+ * dropped as one failing authentication: nothing of it was protected,
+ * and nothing can be flagged.  Its TLVs are looked at when RFC 8972's
+ * HMAC TLV over them verifies (Extra Padding TLVs alone need none);
+ * when it does not, or is missing, the reply carries them as they
+ * came, each flagged I (4.8), and the HMAC TLV made again over
+ * them.  A request of the unauthenticated layout
+ * is answered as before, unless the reflector is authenticated only
+ * (STAMP_DROP_UNAUTH).
  */
 
 #include <sys/types.h>
@@ -83,6 +100,13 @@ struct stamp_refl {
 	double			 clk_at;
 	struct stamp_refl_stats	 st;
 	int			 reply_tos;	/* the last reply's; -1 */
+	/* The authenticated mode: the keys, the request narrowed, and
+	 * what the request being answered and the last reply are. */
+	struct stamp_key	*keys;
+	size_t			 nkeys;
+	uint8_t			*view;		/* STAMP_PKT_MAX */
+	bool			 cur_auth, cur_tlv_bad;
+	const struct stamp_key	*reply_key;	/* NULL: unauthenticated */
 };
 
 double
@@ -321,8 +345,25 @@ int
 stamp_refl_setconf(struct stamp_refl *r, const struct stamp_refl_conf *c)
 {
 	struct stamp_refl_conf	 n = *c;
+	struct stamp_key	*k = NULL;
 	struct sess		*s;
 	unsigned		 i;
+
+	/* The keys, copied first: nothing changed when they cannot be. */
+	if (n.nkeys > STAMP_KEYS_MAX) {
+		errno = E2BIG;
+		return (-1);
+	}
+	if (n.nkeys > 0) {
+		if ((k = calloc(n.nkeys, sizeof(*k))) == NULL)
+			return (-1);
+		memcpy(k, n.keys, n.nkeys * sizeof(*k));
+	}
+	if (n.nkeys > 0 && r->view == NULL && (r->view =
+	    malloc(STAMP_PKT_MAX)) == NULL) {
+		stamp_keys_free(k, n.nkeys);
+		return (-1);
+	}
 
 	if (n.sess_max == 0)
 		n.sess_max = STAMP_SESS_MAX;
@@ -340,11 +381,18 @@ stamp_refl_setconf(struct stamp_refl *r, const struct stamp_refl_conf *c)
 			r->bucket[i] = -1;
 	}
 	if (n.stateful && r->sess == NULL) {
-		if ((s = calloc(n.sess_max, sizeof(*s))) == NULL)
+		if ((s = calloc(n.sess_max, sizeof(*s))) == NULL) {
+			stamp_keys_free(k, n.nkeys);
 			return (-1);
+		}
 		r->sess = s;
 		r->nsessmax = n.sess_max;
 	}
+	stamp_keys_free(r->keys, r->nkeys);
+	r->keys = k;
+	r->nkeys = n.nkeys;
+	r->reply_key = NULL;
+	n.keys = k;
 	r->c = n;
 	return (0);
 }
@@ -371,6 +419,8 @@ stamp_refl_free(struct stamp_refl *r)
 
 	if (r == NULL)
 		return;
+	stamp_keys_free(r->keys, r->nkeys);
+	free(r->view);
 	free(r->sess);
 	free(r);
 }
@@ -528,12 +578,28 @@ tlvs_reflect(struct stamp_refl *r, const struct stamp_rx *rx,
 	if (rc == -1)
 		return;
 	off = STAMP_UNAUTH_LEN;
+	/* Authenticated, the HMAC TLV wrong: none looked at, each I. */
+	if (r->cur_auth && r->cur_tlv_bad) {
+		for (;;) {
+			at = off;
+			if (stamp_tlv_next(out, len, &off, &v) != 1)
+				break;
+			out[at] |= STAMP_TLV_I;
+		}
+		return;
+	}
 	for (;;) {
 		at = off;
 		if (stamp_tlv_next(out, len, &off, &v) != 1)
 			break;
 		switch (v.type) {
 		case STAMP_TLV_PAD:
+			break;
+		case STAMP_TLV_HMAC:
+			/* Made again over the reply's (refl_auth()); of no
+			 * meaning unauthenticated. */
+			if (!r->cur_auth)
+				out[at] |= STAMP_TLV_U;
 			break;
 		case STAMP_TLV_TSINFO:
 			if (v.len < 4) {
@@ -580,14 +646,10 @@ stamp_refl_reply_tos(const struct stamp_refl *r)
 	return (r->reply_tos);
 }
 
-/*
- * The reply to rx in out (outlen octets): its length, rx's, or -1 with
- * why it is not answered.  Its Timestamp (T3) is for the caller to set
- * last, with stamp_refl_send_time(), before it is sent.
- */
-ssize_t
-stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
-    uint8_t *out, size_t outlen, enum stamp_drop *why)
+/* The reply to rx of the unauthenticated layout. */
+static ssize_t
+refl_core(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *out,
+    size_t outlen, enum stamp_drop *why)
 {
 	struct sockaddr_storage	 peer, local;
 	struct sess		*s = NULL;
@@ -667,11 +729,113 @@ stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
 	return ((ssize_t)rx->len);
 }
 
+/* A drop before the core: counted, said. */
+static ssize_t
+refl_drop(struct stamp_refl *r, enum stamp_drop w, enum stamp_drop *why)
+{
+
+	if (why != NULL)
+		*why = w;
+	r->st.dropped[w]++;
+	return (-1);
+}
+
+/*
+ * A request of the authenticated layout: its key the first of its
+ * SSID's, or any's, its HMAC verifies under; the core's reply to it
+ * narrowed, widened again, its HMAC TLV made.
+ */
+static ssize_t
+refl_auth(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *out,
+    size_t outlen, enum stamp_drop *why)
+{
+	const struct stamp_key	*k = NULL;
+	struct stamp_rx		 nrx;
+	uint16_t		 ssid;
+	ssize_t			 n;
+	size_t			 i;
+
+	ssid = stamp_auth_ssid(rx->pkt);
+	for (i = 0; i < r->nkeys && k == NULL; i++)
+		if ((r->keys[i].ssid == STAMP_SSID_ANY || r->keys[i].ssid ==
+		    ssid) && stamp_auth_verify(&r->keys[i], rx->pkt, rx->len))
+			k = &r->keys[i];
+	if (k == NULL)
+		return (refl_drop(r, STAMP_DROP_AUTH, why));
+	if (rx->len > outlen || rx->len > STAMP_PKT_MAX)
+		return (refl_drop(r, STAMP_DROP_NOMEM, why));
+	switch (stamp_auth_tlv_verify(k, rx->pkt, rx->len, STAMP_AUTH_LEN)) {
+	case -1:
+		/* Not TLVs after the base: unprotected octets. */
+		return (refl_drop(r, STAMP_DROP_AUTH, why));
+	case 0:
+		r->cur_tlv_bad = true;
+		break;
+	default:
+		r->cur_tlv_bad = false;
+	}
+	memcpy(r->view, rx->pkt, rx->len);
+	stamp_auth_narrow(r->view, rx->len, false);
+	nrx = *rx;
+	nrx.pkt = r->view;
+	nrx.len = rx->len - (STAMP_AUTH_LEN - STAMP_UNAUTH_LEN);
+	r->cur_auth = true;
+	n = refl_core(r, &nrx, out, outlen, why);
+	r->cur_auth = false;
+	if (n < 0)
+		return (n);
+	if (r->cur_tlv_bad)
+		r->st.tlv_failed++;
+	stamp_auth_widen(out, (size_t)n, true);
+	n += STAMP_AUTH_LEN - STAMP_UNAUTH_LEN;
+	(void)stamp_auth_tlv_seal(k, out, (size_t)n, STAMP_AUTH_LEN);
+	r->reply_key = k;
+	return (n);
+}
+
+/*
+ * The reply to rx in out (outlen octets): its length, rx's, or -1 with
+ * why it is not answered.  Its Timestamp (T3) is for the caller to set
+ * last, with stamp_refl_finish(), before it is sent: an authenticated
+ * reply's HMAC with it.
+ */
+ssize_t
+stamp_refl_reply(struct stamp_refl *r, const struct stamp_rx *rx,
+    uint8_t *out, size_t outlen, enum stamp_drop *why)
+{
+
+	r->reply_key = NULL;
+	r->reply_tos = -1;
+	if (rx->len >= STAMP_AUTH_LEN && stamp_auth_layout(rx->pkt, rx->len))
+		return (refl_auth(r, rx, out, outlen, why));
+	if (r->c.auth_only && rx->len >= STAMP_UNAUTH_LEN)
+		return (refl_drop(r, STAMP_DROP_UNAUTH, why));
+	return (refl_core(r, rx, out, outlen, why));
+}
+
 /* The reply's Timestamp, T3, as late as can be: in the format its
- * Error Estimate says. */
+ * Error Estimate says (the unauthenticated layout). */
 void
 stamp_refl_send_time(uint8_t *out, const struct timespec *t3)
 {
 
 	stamp_ts_put(out + 4, (uint16_t)(out[12] << 8 | out[13]), t3);
+}
+
+/*
+ * The last reply stamp_refl_reply() made (out, len octets) finished:
+ * its Timestamp T3, and, authenticated, its HMAC under the request's
+ * key.  0, or -1.
+ */
+int
+stamp_refl_finish(const struct stamp_refl *r, uint8_t *out, size_t len,
+    const struct timespec *t3)
+{
+
+	if (r->reply_key == NULL) {
+		stamp_refl_send_time(out, t3);
+		return (0);
+	}
+	stamp_auth_send_time(out, t3);
+	return (stamp_auth_seal(r->reply_key, out, len));
 }

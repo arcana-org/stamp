@@ -16,7 +16,9 @@
  * Class of Service TLV, for the replies to come back with it; -M asks
  * for the Direct Measurement TLV (the loss each way by counters), -L
  * for the Location TLV (a NAT on the way seen); -C says this clock's
- * synchronisation.  A TWAMP
+ * synchronisation; -K sends in the authenticated mode, under a key of
+ * the file's (its SSID's when -s says one, else the first, its SSID
+ * then the key's).  A TWAMP
  * Light sender's packet by -l (14 octets and its padding).  In the FIB
  * the process is in: setfib(1).
  */
@@ -30,12 +32,14 @@
 
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -52,9 +56,10 @@ usage(void)
 
 	fprintf(stderr, "usage: stamp [-LMT] [-C source[:error]] [-c count] "
 	    "[-D dscp[/reply]]\n"
-	    "             [-i interval] [-l length] [-m mode] [-p port] "
-	    "[-q seq]\n"
-	    "             [-S sport] [-s ssid] [-t ttl] [-W wait] host\n");
+	    "             [-i interval] [-K keyfile] [-l length] [-m mode] "
+	    "[-p port]\n"
+	    "             [-q seq] [-S sport] [-s ssid] [-t ttl] [-W wait] "
+	    "host\n");
 	exit(1);
 }
 
@@ -196,11 +201,19 @@ main(int argc, char *argv[])
 	size_t			  len = STAMP_UNAUTH_LEN, plen, pad, i;
 	unsigned long		  count = 1, k = 0, measured = 0;
 	int			  ch, fd, kq, ttl = -1, port = STAMP_PORT;
-	int			  sport = 0, rc, dscp = -1, v;
+	int			  sport = 0, rc, dscp = -1, v, kfd;
+	struct stamp_key	 *keys = NULL, key;
+	size_t			  nkeys = 0, base;
+	const char		 *keyfile = NULL;
+	char			  why[256];
+	bool			  ssid_set = false, lset = false;
 
 	memset(&sc, 0, sizeof(sc));
-	while ((ch = getopt(argc, argv, "C:c:D:i:Ll:Mm:p:q:S:s:Tt:W:")) != -1)
+	while ((ch = getopt(argc, argv, "C:c:D:i:K:Ll:Mm:p:q:S:s:Tt:W:")) != -1)
 		switch (ch) {
+		case 'K':
+			keyfile = optarg;
+			break;
 		case 'C':
 			if (stamp_clock_set(optarg) == -1)
 				errx(1, "-C %s: ntp, ptp, ssu, gnss or local, "
@@ -232,6 +245,7 @@ main(int argc, char *argv[])
 			break;
 		case 'l':
 			len = (size_t)num("l", optarg, 0, STAMP_PKT_MAX);
+			lset = true;
 			break;
 		case 'm':
 			if (strcmp(optarg, "stateless") == 0)
@@ -253,6 +267,7 @@ main(int argc, char *argv[])
 			break;
 		case 's':
 			sc.ssid = (uint16_t)num("s", optarg, 0, 65535);
+			ssid_set = true;
 			break;
 		case 't':
 			ttl = (int)num("t", optarg, 1, 255);
@@ -267,6 +282,28 @@ main(int argc, char *argv[])
 	argv += optind;
 	if (argc != 1)
 		usage();
+	/* The key: the SSID's, or the first and its SSID. */
+	if (keyfile != NULL) {
+		if ((kfd = open(keyfile, O_RDONLY | O_CLOEXEC)) == -1)
+			err(1, "%s", keyfile);
+		if (stamp_keys_read(kfd, &keys, &nkeys, why, sizeof(why)) == -1)
+			errx(1, "%s: %s", keyfile, why);
+		close(kfd);
+		for (i = 0; i < nkeys; i++)
+			if (!ssid_set || keys[i].ssid == STAMP_SSID_ANY ||
+			    keys[i].ssid == sc.ssid)
+				break;
+		if (i == nkeys)
+			errx(1, "%s: no key for SSID %u", keyfile, sc.ssid);
+		key = keys[i];
+		stamp_keys_free(keys, nkeys);
+		if (!ssid_set && key.ssid != STAMP_SSID_ANY)
+			sc.ssid = (uint16_t)key.ssid;
+		sc.key = &key;
+	}
+	base = sc.key != NULL ? STAMP_AUTH_LEN : STAMP_UNAUTH_LEN;
+	if (!lset)
+		len = base;
 	if (stamp_sockaddr(argv[0], (uint16_t)port, &to) == -1)
 		errx(1, "%s: no address", argv[0]);
 	if ((fd = stamp_socket(to.ss_family, (uint16_t)sport,
@@ -290,6 +327,11 @@ main(int argc, char *argv[])
 	sc.window = WINDOW;
 	if ((snd = stamp_sender_new(&sc)) == NULL)
 		err(1, "the sender");
+	if (sc.key != NULL)
+		explicit_bzero(&key, sizeof(key));
+	if (sc.key != NULL && len < base)
+		errx(1, "-l %zu: the authenticated mode's packets are %zu octets "
+		    "or more", len, base);
 	/*
 	 * What follows the base: a pattern, to see it come back; with -T
 	 * or -D the TLVs first, the pattern in an Extra Padding TLV after
@@ -298,8 +340,8 @@ main(int argc, char *argv[])
 	 */
 	for (i = STAMP_UNAUTH_LEN; i < sizeof(pkt); i++)
 		pkt[i] = (uint8_t)i;
-	pad = STAMP_UNAUTH_LEN;
-	if (sc.tsinfo || sc.cos || sc.dm || sc.location) {
+	pad = base;
+	if (sc.tsinfo || sc.cos || sc.dm || sc.location || sc.key != NULL) {
 		len = stamp_sender_len(snd, len);
 		plen = len;
 		pad = stamp_sender_len(snd, 0);
@@ -312,13 +354,18 @@ main(int argc, char *argv[])
 		now = stamp_mono();
 		/* The next packet, when its time has come. */
 		if (k < count && now >= start + (double)k * interval) {
+			/* Authenticated, made in place: the pattern again. */
+			if (sc.key != NULL)
+				for (i = STAMP_UNAUTH_LEN; i < sizeof(pkt); i++)
+					pkt[i] = (uint8_t)i;
 			clock_gettime(CLOCK_REALTIME, &t1);
 			if ((rc = stamp_sender_packet(snd, pkt, plen, &t1,
 			    now, &sm)) == -1)
 				err(1, "a packet");
 			if (rc == 1)
 				printf("none\n");
-			memcpy(sent10[seq_of(pkt) & (WINDOW - 1)], pkt + 4, 10);
+			memcpy(sent10[seq_of(pkt) & (WINDOW - 1)], pkt + (sc.key !=
+			    NULL ? 16 : 4), 10);
 			if (sendto(fd, pkt, len, 0, (struct sockaddr *)&to,
 			    to.ss_len) == -1)
 				err(1, "sendto");
@@ -377,8 +424,8 @@ main(int argc, char *argv[])
 			    "ti=%s%s%s%s\n", n,
 			    stamp_sa_ntop((struct sockaddr *)&ri.peer, from,
 			    sizeof(from)), sm.r.seq, sm.r.ssid, sm.r.sseq,
-			    sm.r.sttl, ri.ttl, ok(memcmp(in + 28,
-			    sent10[sm.seq & (WINDOW - 1)], 10) == 0),
+			    sm.r.sttl, ri.ttl, ok(memcmp(in + (sc.key != NULL ? 64 :
+			    28), sent10[sm.seq & (WINDOW - 1)], 10) == 0),
 			    ok(stamp_ts_sub(&sm.r.rx, &sm.r.ts) <= 0),
 			    ok(fabs(stamp_ts_sub(&sm.r.rx, &ri.t)) < 5 &&
 			    fabs(stamp_ts_sub(&sm.r.ts, &ri.t)) < 5),
@@ -425,6 +472,10 @@ main(int argc, char *argv[])
 			printf(" dm_forward=- dm_backward=-");
 		printf("\n");
 	}
+	/* Replies passed over: tampered with, or not of the key. */
+	if (sc.key != NULL && (st.auth_failed > 0 || st.tlv_failed > 0))
+		printf("auth_failed=%ju tlv_failed=%ju\n",
+		    (uintmax_t)st.auth_failed, (uintmax_t)st.tlv_failed);
 	stamp_sender_free(snd);
 	return (st.received > 0 ? 0 : 2);
 }

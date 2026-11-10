@@ -4,8 +4,9 @@ MAN=		stampd.8
 .include "${.CURDIR}/../../share/mk/stamp.mk"
 
 BINDIR=		${PREFIX}/sbin
-CFLAGS+=	${ST_CFLAGS} -DPATH_STAMPD_CONF=\"${PREFIX}/etc/stampd.conf\"
-LDADD+=		${.OBJDIR}/../../lib/libstamp/libstamp.a -lutil
+CFLAGS+=	${ST_CFLAGS} -DPATH_STAMPD_CONF=\"${PREFIX}/etc/stampd.conf\" \
+		-DPATH_STAMPD_KEYS=\"${PREFIX}/etc/stampd.keys\"
+LDADD+=		${.OBJDIR}/../../lib/libstamp/libstamp.a -lutil -lcrypto
 DPADD+=		${.OBJDIR}/../../lib/libstamp/libstamp.a
 
 HAS_TESTS=

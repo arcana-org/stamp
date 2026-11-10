@@ -201,7 +201,8 @@ tlv_find(const uint8_t *pkt, size_t len, uint8_t type, uint16_t vlen,
 	while ((rc = stamp_tlv_next(pkt, len, &off, v)) == 1) {
 		if (v->type != type || v->len < vlen)
 			continue;
-		return ((v->flags & (STAMP_TLV_U | STAMP_TLV_M)) ? 0 : 1);
+		return ((v->flags & (STAMP_TLV_U | STAMP_TLV_M | STAMP_TLV_I)) ? 0 :
+		    1);
 	}
 	return (rc);
 }

@@ -4,7 +4,7 @@ TESTSDIR=	${TESTSBASE}/stamp/libstamp
 ATF_TESTS_C=	libstamp_test
 
 CFLAGS+=	${ST_CFLAGS}
-LDADD+=		${.OBJDIR:H}/libstamp.a
+LDADD+=		${.OBJDIR:H}/libstamp.a -lcrypto
 DPADD+=		${.OBJDIR:H}/libstamp.a
 
 # No mtree(8) hierarchy outside the tree: create the directory first.

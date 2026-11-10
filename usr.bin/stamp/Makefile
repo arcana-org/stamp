@@ -4,7 +4,7 @@ MAN=		stamp.1
 .include "${.CURDIR}/../../share/mk/stamp.mk"
 
 CFLAGS+=	${ST_CFLAGS}
-LDADD+=		${.OBJDIR}/../../lib/libstamp/libstamp.a -lm
+LDADD+=		${.OBJDIR}/../../lib/libstamp/libstamp.a -lcrypto -lm
 DPADD+=		${.OBJDIR}/../../lib/libstamp/libstamp.a
 
 stamp-dirs: .PHONY

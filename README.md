@@ -3,11 +3,13 @@
 The Simple Two-way Active Measurement Protocol (STAMP, RFC 8762) for
 FreeBSD, with the Session-Sender Identifier and the Location,
 Timestamp Information, Class of Service and Direct Measurement TLVs of
-RFC 8972: a library, a Session-Reflector daemon and
-a sender.
+RFC 8972, in both modes, unauthenticated and authenticated: a library,
+a Session-Reflector daemon and a sender.
 
-- **libstamp(3)**: the packets of the unauthenticated mode (room left
-  for the authenticated one; RFC 8972's TLVs read and written, the
+- **libstamp(3)**: the packets of either mode (the authenticated one's
+  112 octets and HMAC-SHA-256-128 by libcrypto, RFC 8972's HMAC TLV
+  over the TLVs, a key a session's SSID, compared in constant time;
+  RFC 8972's TLVs read and written, the
   Timestamp Information TLV filled by the reflector, the Class of
   Service TLV too, the DSCP each way told, the Direct Measurement TLV
   from its sessions' counters, the Location TLV from the addresses and
@@ -27,18 +29,22 @@ a sender.
   for a sender, the TTL, the TOS and the destination address by
   `IP_RECVTTL`/`IP_RECVTOS`/`IP_RECVDSTADDR` and their IPv6 twins,
   the reply from the address the request came to, with the DSCP asked
-  for). A static library with no dependency
-  but libc; another program's sender shares it (arcana-agent's).
+  for). A static library needing libc and libcrypto; another
+  program's sender shares it (arcana-agent's).
 - **stampd(8)**: the reflector. UDP 862 (`-p`) on every address, IPv4
   and IPv6, in the FIB it is started in; root given up once bound
   (`chroot(2)` to `/var/empty`, the user `_stampd`); configuration
-  read again on `SIGHUP`; syslog.
+  read again on `SIGHUP`; syslog. Keys from `stampd.keys` (`-K`), a
+  file root alone reads, read before root is given up and kept open,
+  read again on `SIGHUP`; a request whose HMAC no key verifies dropped
+  and counted, never answered; `-A` answers only authenticated ones.
 - **stamp(1)**: send N test packets at an interval, print each reply's
   fields, the round trip and the delay each way (`-T` asks for the
   Timestamp Information TLV, `-D` for the Class of Service TLV: the
   DSCP each way, `-L` for the Location TLV: a NAT on the way, `-M` for
-  the Direct Measurement TLV), then the loss, each way from a stateful
-  reflector, by its sequence and by the counters.
+  the Direct Measurement TLV; `-K` sends authenticated), then the loss,
+  each way from a stateful reflector, by its sequence and by the
+  counters.
 
 ## FIBs, the base way
 

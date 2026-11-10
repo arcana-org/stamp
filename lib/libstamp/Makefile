@@ -5,7 +5,8 @@
 # shared object links it; installed with its header for that.
 
 LIB=		stamp
-SRCS=		stamp_ts.c stamp_pkt.c stamp_refl.c stamp_send.c stamp_net.c
+SRCS=		stamp_ts.c stamp_pkt.c stamp_auth.c stamp_refl.c stamp_send.c \
+		stamp_net.c
 INCS=		stamp.h
 MAN=		libstamp.3
 

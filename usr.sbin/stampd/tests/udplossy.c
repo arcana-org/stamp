@@ -11,11 +11,13 @@
  * packet on the way out and every b-th reply on the way back is
  * dropped (0: none), so that a sender's loss each way is known
  * exactly; the packets on the way out are held delay milliseconds
- * (default 0), the replies none, so that the delay is one way alone.
+ * (default 0), the replies none, so that the delay is one way alone;
+ * with flip, the octet at that offset of each packet on the way out
+ * has its lowest bit flipped (one tampered with on the way).
  * "ready" on the standard output once it listens; it runs until
  * killed.
  *
- *	udplossy lport rport f b [delay]
+ *	udplossy lport rport f b [delay [flip]]
  */
 
 #include <sys/types.h>
@@ -74,17 +76,20 @@ main(int argc, char *argv[])
 	char			 buf[9000];
 	double			 delay = 0, now;
 	ssize_t			 n;
+	long			 flip = -1;
 	int			 in, out, wait;
 	bool			 have = false;
 
-	if (argc != 5 && argc != 6)
-		errx(1, "usage: udplossy lport rport f b [delay]");
+	if (argc < 5 || argc > 7)
+		errx(1, "usage: udplossy lport rport f b [delay [flip]]");
 	a = lo(atoi(argv[1]));
 	r = lo(atoi(argv[2]));
 	f = strtoul(argv[3], NULL, 10);
 	b = strtoul(argv[4], NULL, 10);
-	if (argc == 6)
+	if (argc >= 6)
 		delay = strtod(argv[5], NULL) / 1000;
+	if (argc == 7)
+		flip = strtol(argv[6], NULL, 10);
 	if ((in = socket(AF_INET, SOCK_DGRAM, 0)) == -1 ||
 	    (out = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
 		err(1, "socket");
@@ -114,6 +119,8 @@ main(int argc, char *argv[])
 			if ((n = recvfrom(in, buf, sizeof(buf), 0,
 			    (struct sockaddr *)&peer, &plen)) > 0) {
 				have = true;
+				if (flip >= 0 && flip < n)
+					buf[flip] ^= 0x01;
 				if (f != 0 && ++fwd % f == 0)
 					;
 				else if (delay <= 0)

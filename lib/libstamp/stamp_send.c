@@ -5,8 +5,8 @@
  */
 
 /*
- * The Session-Sender's core (RFC 8762 4.2), unauthenticated, with the
- * Session-Sender Identifier of RFC 8972 3.  No socket here, as in the
+ * The Session-Sender's core (RFC 8762 4.2), with the Session-Sender
+ * Identifier of RFC 8972 3, in either mode.  No socket here, as in the
  * reflector's: the caller sends the packet it is given and hands over
  * each reply as it came, with the monotonic time of each; out come a
  * sample a packet, its round trip or its loss, and the counts.
@@ -60,6 +60,18 @@
  * sent gives up the oldest, lost.  The losses between two replies are
  * told apart when the later one is passed, every packet before it
  * answered or lost: the counts trail the samples by up to the timeout.
+ *
+ * With a key, the packets are of the authenticated mode (RFC 8762
+ * 4.2.2): 112 octets of base, its HMAC over the first 96, and the TLVs
+ * after it followed by RFC 8972's HMAC TLV (4.8) over them, the Extra
+ * Padding after that.  A reply is taken only when it is of that layout
+ * and its HMAC verifies under the key (auth_failed otherwise: a reply
+ * tampered with, or a reflector of another key, is no reply, and its
+ * packet is lost when its time comes); its TLVs only when they are
+ * well-formed to its end, its HMAC TLV verifies and the reflector
+ * flagged none I (tlv_failed): otherwise the base alone is used.
+ * Authenticated, what follows the base is always TLVs: the padding an
+ * Extra Padding TLV, with or without other TLVs.
  */
 
 #include <sys/types.h>
@@ -68,6 +80,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "stamp.h"
 
@@ -102,6 +115,10 @@ struct stamp_sender {
 	uint32_t		  p_stx, p_rrx, p_rtx, p_srx;
 	int64_t			  dm_fwd, dm_back;
 	struct stamp_sender_stats st;
+	/* The authenticated mode: the key, a reply narrowed. */
+	bool			  auth;
+	struct stamp_key	  key;
+	uint8_t			 *view;		/* STAMP_PKT_MAX */
 };
 
 const char *
@@ -121,6 +138,18 @@ stamp_sender_new(const struct stamp_sender_conf *c)
 	if ((s = calloc(1, sizeof(*s))) == NULL)
 		return (NULL);
 	s->c = *c;
+	if (c->key != NULL) {
+		if (c->key->len < 1 || c->key->len > STAMP_KEY_MAX ||
+		    (s->view = malloc(STAMP_PKT_MAX)) == NULL) {
+			if (c->key->len < 1 || c->key->len > STAMP_KEY_MAX)
+				errno = EINVAL;
+			free(s);
+			return (NULL);
+		}
+		s->key = *c->key;
+		s->auth = true;
+	}
+	s->c.key = NULL;
 	if (s->c.timeout <= 0)
 		s->c.timeout = SND_TIMEOUT;
 	if (s->c.window == 0)
@@ -132,6 +161,8 @@ stamp_sender_new(const struct stamp_sender_conf *c)
 	for (cap = 1; cap < s->c.window; cap <<= 1)
 		;
 	if ((s->ring = calloc(cap, sizeof(*s->ring))) == NULL) {
+		explicit_bzero(&s->key, sizeof(s->key));
+		free(s->view);
 		free(s);
 		return (NULL);
 	}
@@ -150,6 +181,8 @@ stamp_sender_free(struct stamp_sender *s)
 
 	if (s == NULL)
 		return;
+	explicit_bzero(&s->key, sizeof(s->key));
+	free(s->view);
 	free(s->ring);
 	free(s);
 }
@@ -212,30 +245,43 @@ lose(struct stamp_sender *s, uint32_t seq, struct stamp_sample *out)
 }
 
 /* The octets of the TLVs the sender's packets carry, Extra Padding's
- * aside. */
+ * aside: authenticated, the HMAC TLV after them. */
 static size_t
 tlvs_len(const struct stamp_sender *s)
 {
+	size_t	n;
 
-	return ((s->c.tsinfo ? STAMP_TSINFO_LEN : 0) + (s->c.cos ?
+	n = (s->c.tsinfo ? STAMP_TSINFO_LEN : 0) + (s->c.cos ?
 	    STAMP_COS_LEN : 0) + (s->c.dm ? STAMP_DM_LEN : 0) +
-	    (s->c.location ? STAMP_LOCATION_LEN : 0));
+	    (s->c.location ? STAMP_LOCATION_LEN : 0);
+	return (n > 0 && s->auth ? n + STAMP_HMAC_TLV_LEN : n);
+}
+
+/* The base packet's octets: 44, or authenticated 112. */
+static size_t
+base_len(const struct stamp_sender *s)
+{
+
+	return (s->auth ? STAMP_AUTH_LEN : STAMP_UNAUTH_LEN);
 }
 
 /*
  * The length of a packet of the sender's for one of want octets: the
- * base's at least, and with TLVs (Timestamp Information, Class of
- * Service, Direct Measurement, Location), theirs too, what is left
- * after them 0 or an Extra Padding TLV's 4 octets or more.
+ * base's at least (112 authenticated), and with TLVs (Timestamp
+ * Information, Class of Service, Direct Measurement, Location; the HMAC
+ * TLV authenticated), theirs too, what is left after them 0 or an Extra
+ * Padding TLV's 4 octets or more (always a TLV authenticated, with TLVs
+ * or without: nothing but TLVs may follow an authenticated base).
  */
 size_t
 stamp_sender_len(const struct stamp_sender *s, size_t want)
 {
-	size_t	min = STAMP_UNAUTH_LEN + tlvs_len(s);
+	size_t	min = base_len(s) + tlvs_len(s);
 
 	if (want < min)
 		return (min);
-	if (tlvs_len(s) > 0 && want - min > 0 && want - min < STAMP_TLV_HDR)
+	if ((tlvs_len(s) > 0 || s->auth) && want - min > 0 && want - min <
+	    STAMP_TLV_HDR)
 		return (min + STAMP_TLV_HDR);
 	return (want);
 }
@@ -260,13 +306,16 @@ stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
 	uint32_t		 stx;
 	struct stamp_test	 t;
 	struct ent		*e;
-	size_t			 off;
+	size_t			 off, wide;
 	int			 rc = 0;
 
-	if (len < STAMP_UNAUTH_LEN || stamp_sender_len(s, len) != len) {
+	if (len < base_len(s) || stamp_sender_len(s, len) != len) {
 		errno = EMSGSIZE;
 		return (-1);
 	}
+	/* Authenticated: made narrow, widened after. */
+	wide = s->auth ? STAMP_AUTH_LEN - STAMP_UNAUTH_LEN : 0;
+	len -= wide;
 	if (s->next - s->head >= s->c.window) {
 		lose(s, s->head, lostp);
 		rc = 1;
@@ -317,9 +366,21 @@ stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
 		    sizeof(loc)) == -1)
 			return (-1);
 	}
-	if (tlvs_len(s) > 0 && len > off && stamp_tlv_put(buf, len, &off,
-	    STAMP_TLV_PAD, NULL, (uint16_t)(len - off - STAMP_TLV_HDR)) == -1)
+	/* The HMAC TLV after them, made once the packet is wide. */
+	if (s->auth && tlvs_len(s) > 0 && stamp_tlv_put(buf, len, &off,
+	    STAMP_TLV_HMAC, NULL, STAMP_HMAC_LEN) == -1)
 		return (-1);
+	if ((tlvs_len(s) > 0 || s->auth) && len > off && stamp_tlv_put(buf, len,
+	    &off, STAMP_TLV_PAD, NULL, (uint16_t)(len - off - STAMP_TLV_HDR)) ==
+	    -1)
+		return (-1);
+	if (s->auth) {
+		stamp_auth_widen(buf, len, false);
+		len += wide;
+		if (stamp_auth_tlv_seal(&s->key, buf, len, STAMP_AUTH_LEN) == -1
+		    || stamp_auth_seal(&s->key, buf, len) == -1)
+			return (-1);
+	}
 	e = &s->ring[s->next & s->mask];
 	e->st = E_PENDING;
 	e->mono = mono;
@@ -390,14 +451,9 @@ dm_count(struct stamp_sender *s, const struct stamp_dm *dm, uint32_t srx)
 	s->p_srx = srx;
 }
 
-/*
- * A reply (len octets) that came at mono, and t4 (the time of day; NULL
- * not known): 1 and its sample in *out when it answers a packet in
- * flight; 0 when it is none (another session's, late, again); -1 when
- * it is no reflected packet (errno).
- */
-int
-stamp_sender_reply(struct stamp_sender *s, const uint8_t *pkt, size_t len,
+/* A reply of the unauthenticated layout, as stamp_sender_reply(). */
+static int
+reply_core(struct stamp_sender *s, const uint8_t *pkt, size_t len,
     double mono, const struct timespec *t4, struct stamp_sample *out)
 {
 	struct stamp_reflected	 r;
@@ -462,6 +518,47 @@ stamp_sender_reply(struct stamp_sender *s, const uint8_t *pkt, size_t len,
 	}
 	advance(s);
 	return (1);
+}
+
+/*
+ * A reply (len octets) that came at mono, and t4 (the time of day; NULL
+ * not known): 1 and its sample in *out when it answers a packet in
+ * flight; 0 when it is none (another session's, late, again; with a
+ * key, not of the authenticated layout or its HMAC wrong); -1 when it
+ * is no reflected packet (errno).
+ */
+int
+stamp_sender_reply(struct stamp_sender *s, const uint8_t *pkt, size_t len,
+    double mono, const struct timespec *t4, struct stamp_sample *out)
+{
+	size_t	n;
+
+	if (!s->auth)
+		return (reply_core(s, pkt, len, mono, t4, out));
+	if (len > STAMP_PKT_MAX || !stamp_auth_layout(pkt, len) ||
+	    !stamp_auth_verify(&s->key, pkt, len)) {
+		s->st.auth_failed++;
+		return (0);
+	}
+	memcpy(s->view, pkt, len);
+	stamp_auth_narrow(s->view, len, true);
+	n = len - (STAMP_AUTH_LEN - STAMP_UNAUTH_LEN);
+	/* Its TLVs not to be trusted: the base alone. */
+	if (stamp_auth_tlv_verify(&s->key, pkt, len, STAMP_AUTH_LEN) != 1) {
+		s->st.tlv_failed++;
+		n = STAMP_UNAUTH_LEN;
+	} else {
+		struct stamp_tlv	v;
+		size_t			off = STAMP_UNAUTH_LEN;
+
+		while (stamp_tlv_next(s->view, n, &off, &v) == 1)
+			if (v.type != 0 && (v.flags & STAMP_TLV_I)) {
+				s->st.tlv_failed++;
+				n = STAMP_UNAUTH_LEN;
+				break;
+			}
+	}
+	return (reply_core(s, s->view, n, mono, t4, out));
 }
 
 /* The oldest packet in flight past its timeout at mono, lost: 1 and
