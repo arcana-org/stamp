@@ -356,10 +356,13 @@ stamp_sender_packet(struct stamp_sender *s, uint8_t *buf, size_t len,
 			return (-1);
 	}
 	if (s->c.location) {
-		/* The ports, then the destination and the source asked. */
+		/* The ports, then the destination and the source asked,
+		 * each sub-TLV's U set as a TLV's (RFC 8972 4.2). */
 		memset(loc, 0, sizeof(loc));
+		loc[4] = STAMP_TLV_U;
 		loc[5] = STAMP_SUB_DSTIP;
 		loc[7] = 16;
+		loc[24] = STAMP_TLV_U;
 		loc[25] = STAMP_SUB_SRCIP;
 		loc[27] = 16;
 		if (stamp_tlv_put(buf, len, &off, STAMP_TLV_LOCATION, loc,

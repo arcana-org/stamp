@@ -198,7 +198,7 @@ main(int argc, char *argv[])
 	double			  sum = 0, min = 0, max = 0, left, ex;
 	double			  fsum = 0, bsum = 0;
 	ssize_t			  n;
-	size_t			  len = STAMP_UNAUTH_LEN, plen, pad, i;
+	size_t			  len = STAMP_UNAUTH_LEN, plen, pad, padv, i;
 	unsigned long		  count = 1, k = 0, measured = 0;
 	int			  ch, fd, kq, ttl = -1, port = STAMP_PORT;
 	int			  sport = 0, rc, dscp = -1, v, kfd;
@@ -340,11 +340,14 @@ main(int argc, char *argv[])
 	 */
 	for (i = STAMP_UNAUTH_LEN; i < sizeof(pkt); i++)
 		pkt[i] = (uint8_t)i;
-	pad = base;
+	pad = padv = base;
 	if (sc.tsinfo || sc.cos || sc.dm || sc.location || sc.key != NULL) {
 		len = stamp_sender_len(snd, len);
 		plen = len;
 		pad = stamp_sender_len(snd, 0);
+		/* Compared past the Extra Padding TLV's flags, which the
+		 * reflector clears (RFC 8972 4); none when no room for it. */
+		padv = len > pad ? pad + 1 : pad;
 	} else
 		plen = sizeof(pkt);
 
@@ -430,8 +433,8 @@ main(int argc, char *argv[])
 			    ok(fabs(stamp_ts_sub(&sm.r.rx, &ri.t)) < 5 &&
 			    fabs(stamp_ts_sub(&sm.r.ts, &ri.t)) < 5),
 			    ok((sm.r.ee & 0xff) != 0), ok(sm.r.mbz_ok),
-			    ok((size_t)n == len && memcmp(in + pad, pkt + pad,
-			    (size_t)n - pad) == 0), sm.rtt * 1e3, sm.fwd * 1e3,
+			    ok((size_t)n == len && memcmp(in + padv, pkt + padv,
+			    (size_t)n - padv) == 0), sm.rtt * 1e3, sm.fwd * 1e3,
 			    sm.back * 1e3, sm.owd ? "measured" : "estimated",
 			    sm.err * 1e3, tsinfo(&sm), sc.cos ? cos_say(&sm, &ri) :
 			    "", sc.dm ? dm_say(&sm) : "", sc.location ?

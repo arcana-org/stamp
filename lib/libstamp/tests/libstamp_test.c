@@ -763,14 +763,18 @@ ATF_TC_BODY(tlv_tsinfo, tc)
 	ATF_REQUIRE(stamp_tlv_put(p, 52, &off, STAMP_TLV_TSINFO, "\0\0\0\0",
 	    4) == 0);
 	ATF_CHECK_EQ(off, 52);
-	ATF_CHECK(p[44] == 0 && p[45] == 3 && p[46] == 0 && p[47] == 4);
+	ATF_CHECK(p[44] == STAMP_TLV_U && p[45] == 3 && p[46] == 0 &&
+	    p[47] == 4);
 	errno = 0;
 	ATF_CHECK(stamp_tlv_put(p, 55, &off, STAMP_TLV_PAD, NULL, 0) == -1 &&
 	    errno == EMSGSIZE);
 	ATF_REQUIRE(stamp_tlv_put(p, 60, &off, STAMP_TLV_PAD, NULL, 4) == 0);
 	ATF_CHECK(p[53] == 1 && p[55] == 4 && p[56] == 0xaa);
-	/* Found; one the reflector did not know (U) is none, as none at
+	/* As sent (U, RFC 8972 4) none; as a reflector answers (U 0)
+	 * found; one the reflector did not know (U) is none, as none at
 	 * all; TLVs past the packet before it, an error. */
+	ATF_CHECK(stamp_tsinfo_find(p, 60, &ti) == 0);
+	p[44] = 0;
 	ATF_CHECK(stamp_tsinfo_find(p, 60, &ti) == 1);
 	p[44] = STAMP_TLV_U;
 	ATF_CHECK(stamp_tsinfo_find(p, 60, &ti) == 0);
@@ -796,7 +800,8 @@ ATF_TC_BODY(tlv_tsinfo, tc)
 	ATF_REQUIRE(stamp_sender_packet(s, p, 100, &t1, 1, NULL) == 0);
 	off = 0;
 	ATF_REQUIRE(stamp_tlv_next(p, 100, &off, &v) == 1);
-	ATF_CHECK(v.type == STAMP_TLV_TSINFO && v.len == 4 && v.flags == 0);
+	ATF_CHECK(v.type == STAMP_TLV_TSINFO && v.len == 4 &&
+	    v.flags == STAMP_TLV_U);
 	ATF_CHECK(v.value[0] == 0 && v.value[3] == 0);
 	ATF_REQUIRE(stamp_tlv_next(p, 100, &off, &v) == 1);
 	ATF_CHECK(v.type == STAMP_TLV_PAD && v.len == 44 && v.value[0] == 56);
@@ -1014,14 +1019,14 @@ ATF_TC_BODY(tlv_cos, tc)
 	ATF_REQUIRE(stamp_tlv_next(p, 80, &off, &v) == 1);
 	ATF_CHECK(v.type == STAMP_TLV_TSINFO);
 	ATF_REQUIRE(stamp_tlv_next(p, 80, &off, &v) == 1);
-	ATF_CHECK(v.type == STAMP_TLV_COS && v.len == 4 && v.flags == 0);
+	ATF_CHECK(v.type == STAMP_TLV_COS && v.len == 4 &&
+	    v.flags == STAMP_TLV_U);
 	ATF_CHECK(v.value[0] == 46 << 2 && v.value[1] == 0 &&
 	    v.value[2] == 0 && v.value[3] == 0);
 	ATF_REQUIRE(stamp_tlv_next(p, 80, &off, &v) == 1);
 	ATF_CHECK(v.type == STAMP_TLV_PAD && v.len == 16);
-	/* Not reflected yet: DSCP1 alone, RP 0. */
-	ATF_REQUIRE(stamp_cos_find(p, 80, &co) == 1);
-	ATF_CHECK(co.dscp1 == 46 && co.dscp2 == 0 && co.rp == 0);
+	/* Not reflected yet (U): none said. */
+	ATF_CHECK(stamp_cos_find(p, 80, &co) == 0);
 
 	/* Reflected: it came with DSCP 10 and ECN 1 (an ipfw setdscp on
 	 * the way, say); the reply to carry 46. */
@@ -1192,6 +1197,71 @@ ATF_TC_BODY(tlv_dm, tc)
  * on the way told; hidden by the configuration; a source MAC an EUI-64
  * of zero, an unknown sub-TLV marked, sub-TLVs past it malformed.
  */
+/*
+ * The TLVs' flags (RFC 8972 4, 4.2): a sender's U 1, M and I 0, its
+ * Location sub-TLVs' too; a reflector's U, M and I 0 for each TLV and
+ * sub-TLV it knows, whatever the request's, U for one it does not.  As
+ * another implementation (teaparty) reads them: ours sent 0 and left the
+ * sender's flags as they were, so that between two of ours it worked.
+ */
+ATF_TC_WITHOUT_HEAD(tlv_flags);
+ATF_TC_BODY(tlv_flags, tc)
+{
+	struct stamp_refl_conf	 c = { .stateful = false, .port = 862 };
+	struct stamp_sender_conf sc = { .location = true, .tsinfo = true };
+	struct sockaddr_in	 a = sin4("192.0.2.1", 40000);
+	struct sockaddr_in	 l = sin4("198.51.100.7", 0);
+	struct stamp_refl	*r;
+	struct stamp_sender	*s;
+	struct stamp_tlv	 v;
+	struct stamp_rx		 rx;
+	struct timespec		 t1;
+	uint8_t			 p[128], out[STAMP_PKT_MAX];
+	size_t			 off;
+
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_REQUIRE(stamp_sender_len(s, 0) == 100);
+	clock_gettime(CLOCK_REALTIME, &t1);
+	ATF_REQUIRE(stamp_sender_packet(s, p, 100, &t1, 1, NULL) == 0);
+	/* Sent: the Timestamp Information TLV at 44, the Location at 52. */
+	ATF_CHECK_EQ(p[44], STAMP_TLV_U);
+	ATF_CHECK_EQ(p[45], STAMP_TLV_TSINFO);
+	ATF_CHECK_EQ(p[52], STAMP_TLV_U);
+	ATF_CHECK_EQ(p[53], STAMP_TLV_LOCATION);
+	ATF_CHECK_EQ(p[56 + 4], STAMP_TLV_U);
+	ATF_CHECK_EQ(p[56 + 24], STAMP_TLV_U);
+
+	ATF_REQUIRE((r = stamp_refl_new(&c)) != NULL);
+	memset(&rx, 0, sizeof(rx));
+	rx.pkt = p;
+	rx.len = 100;
+	rx.peer = (struct sockaddr *)&a;
+	rx.local = (struct sockaddr *)&l;
+	rx.t2 = t1;
+	rx.mono = 1;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_CHECK_EQ(out[44], 0);
+	ATF_CHECK_EQ(out[52], 0);
+	ATF_CHECK_EQ(out[56 + 4], 0);
+	ATF_CHECK_EQ(out[56 + 24], 0);
+
+	/* A request's M and I, wrongly set, cleared all the same; a TLV of
+	 * a type unknown (Access Report, 6, here) U, its M and I 0. */
+	p[44] = STAMP_TLV_U | STAMP_TLV_M | STAMP_TLV_I;
+	p[56 + 4] = STAMP_TLV_U | STAMP_TLV_I;
+	p[52] = STAMP_TLV_M | STAMP_TLV_I;
+	p[53] = 6;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 100);
+	ATF_CHECK_EQ(out[44], 0);
+	ATF_CHECK_EQ(out[52], STAMP_TLV_U);
+	off = 44;
+	ATF_REQUIRE(stamp_tlv_next(out, 100, &off, &v) == 1);
+	ATF_CHECK(v.type == STAMP_TLV_TSINFO && v.flags == 0);
+
+	stamp_refl_free(r);
+	stamp_sender_free(s);
+}
+
 ATF_TC_WITHOUT_HEAD(tlv_location);
 ATF_TC_BODY(tlv_location, tc)
 {
@@ -1224,8 +1294,8 @@ ATF_TC_BODY(tlv_location, tc)
 	ATF_CHECK(v.value[0] == 0 && v.value[3] == 0);
 	ATF_CHECK(v.value[5] == STAMP_SUB_DSTIP && v.value[7] == 16);
 	ATF_CHECK(v.value[25] == STAMP_SUB_SRCIP && v.value[27] == 16);
-	/* Asked, not answered: none said. */
-	ATF_CHECK(stamp_location_find(p, 100, &loc) == 1);
+	/* Asked, not answered (U): none said. */
+	ATF_CHECK(stamp_location_find(p, 100, &loc) == 0);
 	ATF_CHECK(loc.src.ss_family == 0 && loc.dst.ss_family == 0);
 
 	/* IPv4: what it came from and to. */
@@ -1267,6 +1337,15 @@ ATF_TC_BODY(tlv_location, tc)
 	far.sin_port = htons(10862);
 	ATF_CHECK_EQ(stamp_location_nat(&sm.loc, NULL,
 	    (struct sockaddr *)&far), STAMP_NAT_DST);
+	/* A port the reflector left 0 (RFC 8972 4.2.2: teaparty's) is not
+	 * said, not rewritten: the address alone compared. */
+	((struct sockaddr_in *)&sm.loc.src)->sin_port = 0;
+	self = a;
+	ATF_CHECK_EQ(stamp_location_nat(&sm.loc, (struct sockaddr *)&self,
+	    NULL), 0);
+	self.sin_addr.s_addr = htonl(0x0a000001);
+	ATF_CHECK_EQ(stamp_location_nat(&sm.loc, (struct sockaddr *)&self,
+	    NULL), STAMP_NAT_SRC);
 
 	/* IPv6; the address it came to not known: that one not said. */
 	rx.peer = (struct sockaddr *)&a6;
@@ -1840,6 +1919,7 @@ ATF_TP_ADD_TCS(tp)
 
 	ATF_TP_ADD_TC(tp, tlv_cos);
 	ATF_TP_ADD_TC(tp, tlv_dm);
+	ATF_TP_ADD_TC(tp, tlv_flags);
 	ATF_TP_ADD_TC(tp, tlv_location);
 	ATF_TP_ADD_TC(tp, clock_set);
 	ATF_TP_ADD_TC(tp, tlv_tsinfo);

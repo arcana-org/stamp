@@ -163,8 +163,9 @@ stamp_tlv_next(const uint8_t *pkt, size_t len, size_t *off,
 /*
  * A TLV of type and vlen octets of value (NULL: what is there left as
  * it is) at *off (STAMP_UNAUTH_LEN first) of a packet of len octets,
- * its flags 0, *off moved past it: 0, or -1 with errno EMSGSIZE when
- * it does not fit.
+ * its flags a sender's (RFC 8972 4: U 1, M and I 0; a reflector clears
+ * U for what it knows), *off moved past it: 0, or -1 with errno
+ * EMSGSIZE when it does not fit.
  */
 int
 stamp_tlv_put(uint8_t *pkt, size_t len, size_t *off, uint8_t type,
@@ -176,7 +177,7 @@ stamp_tlv_put(uint8_t *pkt, size_t len, size_t *off, uint8_t type,
 		errno = EMSGSIZE;
 		return (-1);
 	}
-	pkt[at] = 0;
+	pkt[at] = STAMP_TLV_U;
 	pkt[at + 1] = type;
 	put16(pkt + at + 2, vlen);
 	if (value != NULL)
@@ -328,7 +329,8 @@ stamp_location_find(const uint8_t *pkt, size_t len,
 	return (1);
 }
 
-/* a and b the same address, and port unless b's is 0. */
+/* a and b the same address, and port unless either's is 0 (b's not
+ * known, a's not said: a reflector may leave it 0, RFC 8972 4.2.2). */
 static bool
 sa_same(const struct sockaddr_storage *a, const struct sockaddr *b)
 {
@@ -341,13 +343,15 @@ sa_same(const struct sockaddr_storage *a, const struct sockaddr *b)
 		a4 = (const struct sockaddr_in *)(const void *)a;
 		b4 = (const struct sockaddr_in *)(const void *)b;
 		return (a4->sin_addr.s_addr == b4->sin_addr.s_addr &&
-		    (b4->sin_port == 0 || a4->sin_port == b4->sin_port));
+		    (b4->sin_port == 0 || a4->sin_port == 0 ||
+		    a4->sin_port == b4->sin_port));
 	}
 	if (b->sa_family == AF_INET6) {
 		a6 = (const struct sockaddr_in6 *)(const void *)a;
 		b6 = (const struct sockaddr_in6 *)(const void *)b;
 		return (memcmp(&a6->sin6_addr, &b6->sin6_addr, 16) == 0 &&
-		    (b6->sin6_port == 0 || a6->sin6_port == b6->sin6_port));
+		    (b6->sin6_port == 0 || a6->sin6_port == 0 ||
+		    a6->sin6_port == b6->sin6_port));
 	}
 	return (false);
 }
@@ -355,7 +359,8 @@ sa_same(const struct sockaddr_storage *a, const struct sockaddr *b)
 /*
  * What loc says was rewritten between this end and the reflector:
  * STAMP_NAT_SRC when the source it saw is not self (the address and
- * port this end sent from; port 0 not compared), STAMP_NAT_DST when the
+ * port this end sent from; a port 0, either's, not compared),
+ * STAMP_NAT_DST when the
  * destination is not far (the address and port it sent to); what loc
  * does not say, or self or far NULL, not compared.
  */

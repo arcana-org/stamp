@@ -515,6 +515,8 @@ loc_reflect(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *v,
 	for (at = 4; at < vlen; at += 4 + (size_t)slen) {
 		p = v + at;
 		slen = (uint16_t)(p[2] << 8 | p[3]);
+		/* U, M and I 0 for what is known (RFC 8972 4.2), U else. */
+		p[0] &= ~(STAMP_TLV_U | STAMP_TLV_M | STAMP_TLV_I);
 		if (p[1] == STAMP_SUB_SRCIP && slen == 16)
 			p[1] = loc_put(p + 4, rx->peer, STAMP_SUB_SRCIP4,
 			    STAMP_SUB_SRCIP6, af, hide);
@@ -584,7 +586,8 @@ tlvs_reflect(struct stamp_refl *r, const struct stamp_rx *rx,
 			at = off;
 			if (stamp_tlv_next(out, len, &off, &v) != 1)
 				break;
-			out[at] |= STAMP_TLV_I;
+			out[at] = (uint8_t)((out[at] & ~(STAMP_TLV_U |
+			    STAMP_TLV_M)) | STAMP_TLV_I);
 		}
 		return;
 	}
@@ -592,6 +595,9 @@ tlvs_reflect(struct stamp_refl *r, const struct stamp_rx *rx,
 		at = off;
 		if (stamp_tlv_next(out, len, &off, &v) != 1)
 			break;
+		/* The sender's U 1 (RFC 8972 4): each flag 0 but where the
+		 * TLV is not known (U), malformed (M). */
+		out[at] &= ~(STAMP_TLV_U | STAMP_TLV_M | STAMP_TLV_I);
 		switch (v.type) {
 		case STAMP_TLV_PAD:
 			break;
