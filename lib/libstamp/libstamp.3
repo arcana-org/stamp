@@ -3,7 +3,7 @@
 .\"
 .\" Copyright (c) 2026 Pouria Mousavizadeh Tehrani <pouria@FreeBSD.org>
 .\"
-.Dd November 10, 2026
+.Dd November 11, 2026
 .Dt LIBSTAMP 3
 .Os
 .Sh NAME
@@ -417,18 +417,31 @@ section 4.3.2) rather than copying the sender's; a session is the
 caller's tag (a FIB), the sender's address and port, the address the
 packet came to and the SSID.
 .It Va rate , burst
-Replies a second to one source address, and the burst its token bucket
-allows (0: twice the rate); a rate of 0 sets no limit.
+Replies a second to one source, and the burst its token bucket allows
+(0: twice the rate); a rate of 0 sets no limit.
+A source is an IPv4 address (an IPv4-mapped IPv6 address alike) or an
+IPv6 /64.
 The buckets are a table of 4096, four ways a set, keyed by a random
 secret, a new source taking its set's oldest.
 .It Va rate_total
 Replies a second to all sources, its burst as many; 0 none.
+A request whose HMAC verified draws from buckets apart, its source's
+and a total of its own as large, so that unauthenticated requests,
+whose source addresses anybody writes, do not starve the authenticated
+ones.
 .It Va sess_max , sess_idle
 Sessions kept at most
-.Pq Dv STAMP_SESS_MAX , No 4096 , No the oldest replaced
+.Pq Dv STAMP_SESS_MAX , No 4096
 and the seconds one ends after without a packet
 .Pq Dv STAMP_SESS_IDLE , No 300 ;
 0 for those.
+A session made by an authenticated request is apart from an
+unauthenticated one of the same key.
+When the table is full the oldest made unauthenticated is replaced, an
+authenticated one only by another authenticated request and when there
+is none made unauthenticated; an unauthenticated request then makes
+none and is not answered
+.Pq Dv STAMP_DROP_FULL .
 .It Va port
 The reflector's own port: a packet from it is not answered, nor one
 from port 0.
@@ -483,8 +496,9 @@ the address it came to, zero when
 .Va local
 is NULL; one asking for the source MAC answered as an EUI-64 of zero,
 no UDP socket seeing it; another marked unrecognised); one of those
-too short, not as long as its kind is (Class of Service 4, Direct
-Measurement 12) or whose sub-TLVs run past it marked malformed
+not as long as its kind is (Timestamp Information 4 or more, Class of
+Service 4, Direct Measurement 12, Location 4 or more) or whose sub-TLVs
+run past it marked malformed
 .Pq Dv STAMP_TLV_M ,
 and any other but Extra Padding marked unrecognised
 .Pq Dv STAMP_TLV_U ;
@@ -496,11 +510,12 @@ Service TLV's DSCP1, or, refused by
 the request's DSCP; \-1 (the socket's own) when the request had no
 such TLV, or its TOS is not known.
 A packet shorter than the base, from port 0 or the reflector's own,
-over a rate limit, authenticated with no key that verifies it, or not
-authenticated to a reflector authenticated only, is not answered:
-\-1, why in
+over a rate limit, authenticated with no key that verifies it, not
+authenticated to a reflector authenticated only, or not authenticated
+to a stateful one whose sessions are all authenticated, is not
+answered: \-1, why in
 .Fa *why
-.Pq Dv STAMP_DROP_SHORT , STAMP_DROP_PORT , STAMP_DROP_RATE , STAMP_DROP_AUTH , STAMP_DROP_UNAUTH ,
+.Pq Dv STAMP_DROP_SHORT , STAMP_DROP_PORT , STAMP_DROP_RATE , STAMP_DROP_AUTH , STAMP_DROP_UNAUTH , STAMP_DROP_FULL ,
 counted.
 The caller sets the reply's own timestamp (T3) as late as it can with
 .Fn stamp_refl_finish ,

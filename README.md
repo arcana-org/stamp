@@ -18,7 +18,9 @@ a Session-Reflector daemon and a sender.
   synchronisation source from `ntp_gettime(2)` (or as the process says,
   for a clock the kernel does not know is synchronised), the
   Session-Reflector's core (stateless or stateful sessions, per-source
-  and global rate limits, the reply), the Session-Sender's core (a
+  (an IPv6 /64 one source) and global rate limits, the authenticated
+  requests' apart, their sessions never replaced by unauthenticated
+  ones, the reply), the Session-Sender's core (a
   session's sequence, the replies matched, the round trip with the
   reflector's time taken out, the delay each way when both Error
   Estimates say synchronised and their errors together are within a
@@ -34,7 +36,8 @@ a Session-Reflector daemon and a sender.
 - **stampd(8)**: the reflector. UDP 862 (`-p`) on every address, IPv4
   and IPv6, in the FIB it is started in; root given up once bound
   (`chroot(2)` to `/var/empty`, the user `_stampd`); configuration
-  read again on `SIGHUP`; syslog. Keys from `stampd.keys` (`-K`), a
+  read again on `SIGHUP`; its counters logged on `SIGINFO` or
+  `SIGUSR1`; syslog. Keys from `stampd.keys` (`-K`), a
   file root alone reads, read before root is given up and kept open,
   read again on `SIGHUP`; a request whose HMAC no key verifies dropped
   and counted, never answered; `-A` answers only authenticated ones.

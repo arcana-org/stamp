@@ -22,6 +22,8 @@
  * A request whose HMAC no key verifies is dropped and counted, never
  * answered; -A answers none that is not authenticated.  No key is ever
  * logged.
+ *
+ * SIGINFO and SIGUSR1 log the reflector's counters, a line.
  */
 
 #include <sys/param.h>
@@ -80,6 +82,7 @@ static int			 conf_dir = -1;	/* the file's, kept for a reload */
 static char			 conf_name[MAXPATHLEN];
 static bool			 conf_must;	/* -f: it must be there */
 static uint64_t			 drops_told, auth_told, unauth_told;
+static uint64_t			 full_told;
 static int			 keys_fd = -1;	/* the key file, kept open */
 static const char		*keys_path;
 static struct stamp_key		*keys;
@@ -409,12 +412,47 @@ drops_tell(void)
 		syslog(LOG_INFO, "%ju requests not authenticated dropped",
 		    (uintmax_t)st.dropped[STAMP_DROP_UNAUTH]);
 	unauth_told = st.dropped[STAMP_DROP_UNAUTH];
+	if (st.dropped[STAMP_DROP_FULL] != full_told)
+		syslog(LOG_NOTICE, "%ju requests not authenticated dropped, "
+		    "the sessions all authenticated",
+		    (uintmax_t)st.dropped[STAMP_DROP_FULL]);
+	full_told = st.dropped[STAMP_DROP_FULL];
+}
+
+/* The reflector's counters, a line (SIGINFO, SIGUSR1). */
+static void
+stats_tell(void)
+{
+	static const char *const names[STAMP_DROP_MAX] = {
+		[STAMP_DROP_SHORT] = "short",
+		[STAMP_DROP_PORT] = "port",
+		[STAMP_DROP_RATE] = "rate",
+		[STAMP_DROP_NOMEM] = "nomem",
+		[STAMP_DROP_AUTH] = "auth",
+		[STAMP_DROP_UNAUTH] = "unauth",
+		[STAMP_DROP_FULL] = "full",
+	};
+	struct stamp_refl_stats	 st;
+	char			 buf[512];
+	size_t			 len;
+	int			 i;
+
+	stamp_refl_stats(refl, &st);
+	len = 0;
+	for (i = STAMP_ANSWERED + 1; i < STAMP_DROP_MAX; i++)
+		if (len < sizeof(buf))
+			len += (size_t)snprintf(buf + len, sizeof(buf) - len,
+			    " %s=%ju", names[i] != NULL ? names[i] : "?",
+			    (uintmax_t)st.dropped[i]);
+	syslog(LOG_INFO, "answered=%ju dropped:%s tlv_failed=%ju sessions=%zu",
+	    (uintmax_t)st.answered, buf, (uintmax_t)st.tlv_failed,
+	    st.sessions);
 }
 
 int
 main(int argc, char *argv[])
 {
-	struct kevent	 kev[8];
+	struct kevent	 kev[10];
 	struct pidfh	*pfh = NULL;
 	struct passwd	*pw = NULL;
 	const char	*pidfile = NULL, *user = STAMPD_USER, *e;
@@ -599,10 +637,14 @@ main(int argc, char *argv[])
 	EV_SET(&kev[n++], SIGHUP, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
 	EV_SET(&kev[n++], SIGTERM, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
 	EV_SET(&kev[n++], SIGINT, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
+	EV_SET(&kev[n++], SIGINFO, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
+	EV_SET(&kev[n++], SIGUSR1, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
 	EV_SET(&kev[n++], 1, EVFILT_TIMER, EV_ADD, NOTE_SECONDS, TICK_S, NULL);
 	(void)signal(SIGHUP, SIG_IGN);
 	(void)signal(SIGTERM, SIG_IGN);
 	(void)signal(SIGINT, SIG_IGN);
+	(void)signal(SIGINFO, SIG_IGN);
+	(void)signal(SIGUSR1, SIG_IGN);
 	if (kevent(kq, kev, n, NULL, 0, NULL) == -1) {
 		syslog(LOG_ERR, "kevent: %m");
 		exit(1);
@@ -626,6 +668,11 @@ main(int argc, char *argv[])
 				drops_tell();
 				break;
 			case EVFILT_SIGNAL:
+				if (kev[i].ident == SIGINFO ||
+				    kev[i].ident == SIGUSR1) {
+					stats_tell();
+					break;
+				}
 				if (kev[i].ident != SIGHUP) {
 					drops_tell();
 					syslog(LOG_INFO, "stopping");

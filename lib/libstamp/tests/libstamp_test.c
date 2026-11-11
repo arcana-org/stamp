@@ -438,6 +438,57 @@ ATF_TC_BODY(reflect_rate, tc)
 	stamp_refl_free(r);
 }
 
+/*
+ * A source's bucket: an IPv6 address's /64, whose 2^64 addresses one
+ * sender has; an IPv4 address, an IPv4-mapped IPv6 one the same.
+ */
+ATF_TC_WITHOUT_HEAD(reflect_rate_v6);
+ATF_TC_BODY(reflect_rate_v6, tc)
+{
+	struct stamp_refl_conf	c = { .rate = 2, .burst = 4 };
+	struct stamp_refl	*r;
+	struct sockaddr_in6	a = sin6("2001:db8::1", 40000);
+	struct sockaddr_in6	b = sin6("2001:db8::2", 40001);
+	struct sockaddr_in6	d = sin6("2001:db8::ffff:1:2:3", 40000);
+	struct sockaddr_in6	e = sin6("2001:db8:0:1::1", 40000);
+	struct sockaddr_in6	m = sin6("::ffff:192.0.2.1", 40000);
+	struct sockaddr_in6	m3 = sin6("::ffff:192.0.2.3", 40000);
+	struct sockaddr_in	v = sin4("192.0.2.1", 40000);
+	struct sockaddr_in	v2 = sin4("192.0.2.2", 40000);
+	struct sockaddr_in	v3 = sin4("192.0.2.3", 40000);
+	uint8_t			p[STAMP_PKT_MAX], out[STAMP_PKT_MAX];
+	enum stamp_drop		why;
+	int			i;
+
+	ATF_REQUIRE((r = stamp_refl_new(&c)) != NULL);
+	pkt_make(p, 44, 1, 1);
+	for (i = 0; i < 4; i++)
+		ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&a, NULL, 0, 100,
+		    out, NULL) == 44);
+	/* Another address of the /64, another port: its bucket, empty. */
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&b, NULL, 0, 100, out,
+	    &why) == -1 && why == STAMP_DROP_RATE);
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&d, NULL, 0, 100, out,
+	    &why) == -1 && why == STAMP_DROP_RATE);
+	/* Another /64: a bucket of its own. */
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&e, NULL, 0, 100, out,
+	    NULL) == 44);
+	/* IPv4: the address, mapped or not. */
+	for (i = 0; i < 4; i++)
+		ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&v, NULL, 0, 100,
+		    out, NULL) == 44);
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&m, NULL, 0, 100, out,
+	    &why) == -1 && why == STAMP_DROP_RATE);
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&v2, NULL, 0, 100, out,
+	    NULL) == 44);
+	for (i = 0; i < 4; i++)
+		ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&m3, NULL, 0, 100,
+		    out, NULL) == 44);
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&v3, NULL, 0, 100, out,
+	    &why) == -1 && why == STAMP_DROP_RATE);
+	stamp_refl_free(r);
+}
+
 /* ---- The sender against the reflector's core, in process ---------- */
 
 /*
@@ -1258,6 +1309,22 @@ ATF_TC_BODY(tlv_flags, tc)
 	ATF_REQUIRE(stamp_tlv_next(out, 100, &off, &v) == 1);
 	ATF_CHECK(v.type == STAMP_TLV_TSINFO && v.flags == 0);
 
+	/* A Timestamp Information TLV under its 4 octets: malformed (M),
+	 * as the Class of Service and Direct Measurement ones, not
+	 * unrecognised. */
+	p[44] = STAMP_TLV_U;
+	p[45] = STAMP_TLV_TSINFO;
+	p[46] = 0;
+	p[47] = 0;
+	rx.len = 48;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 48);
+	ATF_CHECK_EQ(out[44], STAMP_TLV_M);
+	p[47] = 3;
+	rx.len = 51;
+	ATF_REQUIRE(stamp_refl_reply(r, &rx, out, sizeof(out), NULL) == 51);
+	ATF_CHECK_EQ(out[44], STAMP_TLV_M);
+	ATF_CHECK(memcmp(out + 48, p + 48, 3) == 0);
+
 	stamp_refl_free(r);
 	stamp_sender_free(s);
 }
@@ -1455,6 +1522,160 @@ auth_send(struct stamp_sender *s, struct stamp_refl *r, double mono,
 		ATF_REQUIRE(stamp_refl_finish(r, out, (size_t)n, &t1) == 0);
 	}
 	return (n);
+}
+
+static uint32_t
+be32(const uint8_t *p)
+{
+
+	return ((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+	    (uint32_t)p[2] << 8 | p[3]);
+}
+
+/*
+ * A request whose HMAC verified draws from buckets of its own: a flood
+ * not authenticated, from its sender's own address or from many,
+ * starves it not, and it is bounded all the same.
+ */
+ATF_TC_WITHOUT_HEAD(reflect_rate_auth);
+ATF_TC_BODY(reflect_rate_auth, tc)
+{
+	struct stamp_key	  k = key_make(7, 1);
+	struct stamp_sender_conf  sc = { .ssid = 7, .key = &k };
+	struct stamp_refl_conf	  c = { .rate = 2, .burst = 4,
+	    .rate_total = 6, .port = 862, .keys = &k, .nkeys = 1 };
+	struct sockaddr_in	  a = sin4("192.0.2.1", 40000);
+	struct stamp_sender	 *s;
+	struct stamp_refl	 *r;
+	struct stamp_refl_stats	  st;
+	enum stamp_drop		  why;
+	uint8_t			  p[STAMP_PKT_MAX], q[STAMP_PKT_MAX];
+	uint8_t			  out[STAMP_PKT_MAX];
+	size_t			  plen;
+	ssize_t			  n;
+	int			  i, ans, phase;
+
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&c)) != NULL);
+	pkt_make(p, 44, 1, 7);
+	/* Its sender's address flooded: that bucket's 4, and its own 4. */
+	for (i = ans = 0; i < 10; i++)
+		if (reply(r, p, 44, (struct sockaddr *)&a, NULL, 0, 100, out,
+		    NULL) == 44)
+			ans++;
+	ATF_CHECK_EQ(ans, 4);
+	for (i = ans = 0; i < 10; i++)
+		if ((n = auth_send(s, r, 100, 0, q, &plen, out, &why)) > 0)
+			ans++;
+		else
+			ATF_CHECK_EQ(why, STAMP_DROP_RATE);
+	ATF_CHECK_EQ(ans, 4);
+	/*
+	 * Many sources (a source address each, as anybody writes them):
+	 * the total's 6; the authenticated requests' total another 6, a
+	 * source's 4 of them, then, no limit to a source, all 6.
+	 */
+	for (phase = 0; phase < 2; phase++) {
+		if (phase == 1) {
+			c.rate = 0;
+			ATF_REQUIRE(stamp_refl_setconf(r, &c) == 0);
+		}
+		for (i = ans = 0; i < 20; i++) {
+			struct sockaddr_in	f = sin4("203.0.113.1", 1000);
+
+			f.sin_addr.s_addr = htonl(0xcb007100 + (uint32_t)i);
+			if (reply(r, p, 44, (struct sockaddr *)&f, NULL, 0,
+			    200 + 100 * phase, out, NULL) == 44)
+				ans++;
+		}
+		ATF_CHECK_EQ(ans, 6);
+		for (i = ans = 0; i < 10; i++)
+			if (auth_send(s, r, 200 + 100 * phase, 0, q, &plen, out,
+			    NULL) > 0)
+				ans++;
+		ATF_CHECK_EQ(ans, phase == 0 ? 4 : 6);
+	}
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&a, NULL, 0, 300, out,
+	    &why) == -1 && why == STAMP_DROP_RATE);
+	/* Counted as before: the rate's drops, either kind. */
+	stamp_refl_stats(r, &st);
+	ATF_CHECK_EQ(st.answered, 4 + 4 + 6 + 4 + 6 + 6);
+	ATF_CHECK_EQ(st.dropped[STAMP_DROP_RATE], 6 + 6 + 14 + 6 + 14 + 4 + 1);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+}
+
+/*
+ * Sessions made by authenticated requests: apart from unauthenticated
+ * ones of the same key, never replaced by one; the table full, the
+ * oldest unauthenticated replaced first, an authenticated one only by
+ * another; full of them, an unauthenticated request dropped.
+ */
+ATF_TC_WITHOUT_HEAD(reflect_sessions_auth);
+ATF_TC_BODY(reflect_sessions_auth, tc)
+{
+	struct stamp_key	  k = key_make(STAMP_SSID_ANY, 1);
+	struct stamp_sender_conf  c7 = { .ssid = 7, .key = &k };
+	struct stamp_sender_conf  c8 = { .ssid = 8, .key = &k };
+	struct stamp_sender_conf  c9 = { .ssid = 9, .key = &k };
+	struct stamp_refl_conf	  rc = { .stateful = true, .sess_max = 2,
+	    .port = 862, .keys = &k, .nkeys = 1 };
+	struct sockaddr_in	  a = sin4("192.0.2.1", 40000);
+	struct sockaddr_in	  l = sin4("192.0.2.2", 862);
+	struct sockaddr_in	  b = sin4("192.0.2.3", 1);
+	struct sockaddr_in	  d = sin4("192.0.2.4", 1);
+	struct stamp_sender	 *s7, *s8, *s9;
+	struct stamp_refl	 *r;
+	struct stamp_refl_stats	  st;
+	enum stamp_drop		  why;
+	uint8_t			  p[STAMP_PKT_MAX], q[STAMP_PKT_MAX];
+	uint8_t			  out[STAMP_PKT_MAX];
+	size_t			  plen;
+
+	ATF_REQUIRE((s7 = stamp_sender_new(&c7)) != NULL);
+	ATF_REQUIRE((s8 = stamp_sender_new(&c8)) != NULL);
+	ATF_REQUIRE((s9 = stamp_sender_new(&c9)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	ATF_REQUIRE(auth_send(s7, r, 1, 0, q, &plen, out, NULL) > 0);
+	ATF_CHECK_EQ(be32(out), 0);
+	/* Its key, unauthenticated: a session apart, its count untouched. */
+	pkt_make(p, 44, 1, 7);
+	ATF_REQUIRE(reply(r, p, 44, (struct sockaddr *)&a, (struct sockaddr *)
+	    &l, 0, 2, out, NULL) == 44);
+	ATF_CHECK_EQ(seq_of(out), 0);
+	/* Full: the unauthenticated one replaced, though the other is
+	 * older. */
+	ATF_REQUIRE(reply(r, p, 44, (struct sockaddr *)&b, NULL, 0, 3, out,
+	    NULL) == 44);
+	ATF_CHECK_EQ(seq_of(out), 0);
+	ATF_REQUIRE(auth_send(s7, r, 4, 0, q, &plen, out, NULL) > 0);
+	ATF_CHECK_EQ(be32(out), 1);
+	/* Another authenticated: in the unauthenticated one's place. */
+	ATF_REQUIRE(auth_send(s8, r, 5, 0, q, &plen, out, NULL) > 0);
+	ATF_CHECK_EQ(be32(out), 0);
+	/* All authenticated: an unauthenticated request makes none. */
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&d, NULL, 0, 6, out,
+	    &why) == -1 && why == STAMP_DROP_FULL);
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&a, (struct sockaddr *)
+	    &l, 0, 6, out, &why) == -1 && why == STAMP_DROP_FULL);
+	ATF_REQUIRE(auth_send(s7, r, 7, 0, q, &plen, out, NULL) > 0);
+	ATF_CHECK_EQ(be32(out), 2);
+	ATF_REQUIRE(auth_send(s8, r, 8, 0, q, &plen, out, NULL) > 0);
+	ATF_CHECK_EQ(be32(out), 1);
+	/* Another authenticated one: the oldest of them (7's) replaced. */
+	ATF_REQUIRE(auth_send(s9, r, 9, 0, q, &plen, out, NULL) > 0);
+	ATF_CHECK_EQ(be32(out), 0);
+	ATF_REQUIRE(auth_send(s8, r, 10, 0, q, &plen, out, NULL) > 0);
+	ATF_CHECK_EQ(be32(out), 2);
+	ATF_REQUIRE(auth_send(s7, r, 11, 0, q, &plen, out, NULL) > 0);
+	ATF_CHECK_EQ(be32(out), 0);
+	stamp_refl_stats(r, &st);
+	ATF_CHECK_EQ(st.dropped[STAMP_DROP_FULL], 2);
+	ATF_CHECK_EQ(st.sessions, 2);
+	stamp_sender_free(s7);
+	stamp_sender_free(s8);
+	stamp_sender_free(s9);
+	stamp_refl_free(r);
 }
 
 ATF_TC_WITHOUT_HEAD(auth_layout);
@@ -1910,6 +2131,8 @@ ATF_TP_ADD_TCS(tp)
 {
 
 	ATF_TP_ADD_TC(tp, auth_layout);
+	ATF_TP_ADD_TC(tp, reflect_rate_auth);
+	ATF_TP_ADD_TC(tp, reflect_sessions_auth);
 	ATF_TP_ADD_TC(tp, auth_hmac);
 	ATF_TP_ADD_TC(tp, auth_round_trip);
 	ATF_TP_ADD_TC(tp, auth_tamper);
@@ -1942,5 +2165,6 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, reflect_stateful);
 	ATF_TP_ADD_TC(tp, reflect_sessions_max);
 	ATF_TP_ADD_TC(tp, reflect_rate);
+	ATF_TP_ADD_TC(tp, reflect_rate_v6);
 	return (atf_no_error());
 }

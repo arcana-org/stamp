@@ -18,9 +18,14 @@
  * way out from loss on the way back; a session also counts the requests
  * it received (one over a rate limit among them) and the replies it
  * made, for RFC 8972's Direct Measurement TLV, which a stateless
- * reflector answers with zeros.  Sessions are bounded (sess_max,
- * the oldest replaced when full) and end after sess_idle seconds
- * without a packet.
+ * reflector answers with zeros.  A session made by an authenticated
+ * request is one of its own, apart from an unauthenticated one of the
+ * same key, which neither counts in it nor replaces it.  Sessions are
+ * bounded (sess_max: when full, the oldest made unauthenticated
+ * replaced, an authenticated one only by another and when there is no
+ * other; an unauthenticated request finding them all authenticated
+ * dropped, STAMP_DROP_FULL) and end after sess_idle seconds without a
+ * packet.
  *
  * A reflector answers whoever writes a source address, so it is no
  * amplifier and no firehose.  Only a packet of STAMP_UNAUTH_LEN octets
@@ -29,10 +34,14 @@
  * Service, Direct Measurement and Location TLVs filled, those not known
  * marked so).  Not one from port 0 nor from the reflector's own port (two reflectors made to answer each other
  * forever by one forged packet).  And no more replies to one source
- * address than its token bucket allows, nor to all of them together
- * than one more: the sources' buckets a table of RL_SLOTS, RL_WAYS a
- * set, its hash keyed by a random secret so that no sender chooses
- * whom it displaces, a new source taking the set's oldest.
+ * than its token bucket allows, nor to all of them together than one
+ * more: a source an IPv4 address (an IPv4-mapped IPv6 one alike) or an
+ * IPv6 /64, whose 2^64 addresses one sender has; the sources' buckets a
+ * table of RL_SLOTS, RL_WAYS a set, its hash keyed by a random secret
+ * so that no sender chooses whom it displaces, a new source taking the
+ * set's oldest.  A request whose HMAC verified draws from buckets apart
+ * (its source's, and a total of its own as large), so that whoever
+ * writes source addresses does not starve the authenticated sessions.
  *
  * The authenticated mode (RFC 8762 4.4): a request of its layout
  * (stamp_auth_layout()) is answered only when its HMAC verifies under a
@@ -77,12 +86,14 @@ struct sess {
 	struct sockaddr_storage	 local;		/* address only */
 	uint32_t		 seq;		/* the next reflected */
 	uint32_t		 rx, tx;	/* received, sent: RFC 8972 4.5 */
+	bool			 auth;		/* made authenticated */
 	double			 last;
 	int			 next;		/* in its bucket; -1 the end */
 };
 
 struct rl {
-	uint8_t		 addr[16];	/* an IPv4 address mapped */
+	uint8_t		 addr[16];	/* rl_key()'s */
+	bool		 auth;		/* the authenticated requests' */
 	double		 tokens;
 	double		 last;		/* 0: unused */
 };
@@ -96,6 +107,7 @@ struct stamp_refl {
 	struct rl		 rl[RL_SLOTS];
 	uint32_t		 key;
 	double			 all_tokens, all_last;
+	double			 auth_tokens, auth_last;	/* HMAC verified */
 	struct stamp_clock	 clk;
 	double			 clk_at;
 	struct stamp_refl_stats	 st;
@@ -233,44 +245,58 @@ stamp_refl_expire(struct stamp_refl *r, double now)
 			sess_unlink(r, (int)i);
 }
 
-/* The session, made if new and create (the oldest replaced when the
- * table is full), else NULL. */
+/*
+ * The session, authenticated or not as auth, made if new and create,
+ * else NULL.  The table full, the oldest made unauthenticated is
+ * replaced; an authenticated one only for another, when there is no
+ * unauthenticated one: NULL when there is none to replace.
+ */
 static struct sess *
 sess_get(struct stamp_refl *r, int tag, uint16_t ssid,
     const struct sockaddr_storage *peer, const struct sockaddr_storage *local,
-    double now, bool create)
+    double now, bool create, bool auth)
 {
 	struct sess	*s;
 	unsigned	 b;
-	int		 i, free_i, old_i;
+	int		 i, free_i, old_i, old_a;
 
 	b = sess_hash(tag, ssid, peer);
 	for (i = r->bucket[b]; i != -1; i = r->sess[i].next) {
 		s = &r->sess[i];
-		if (s->tag == tag && s->ssid == ssid && addr_eq(&s->peer, peer,
-		    true) && addr_eq(&s->local, local, false)) {
+		if (s->tag == tag && s->ssid == ssid && s->auth == auth &&
+		    addr_eq(&s->peer, peer, true) && addr_eq(&s->local, local,
+		    false)) {
 			s->last = now;
 			return (s);
 		}
 	}
 	if (!create)
 		return (NULL);
-	free_i = old_i = -1;
+	free_i = old_i = old_a = -1;
 	for (i = 0; i < (int)r->nsessmax; i++) {
-		if (!r->sess[i].used) {
+		s = &r->sess[i];
+		if (!s->used) {
 			free_i = i;
 			break;
 		}
-		if (old_i == -1 || r->sess[i].last < r->sess[old_i].last)
+		if (s->auth) {
+			if (old_a == -1 || s->last < r->sess[old_a].last)
+				old_a = i;
+		} else if (old_i == -1 || s->last < r->sess[old_i].last)
 			old_i = i;
 	}
 	if (free_i == -1) {
+		if (old_i == -1 && auth)
+			old_i = old_a;
+		if (old_i == -1)
+			return (NULL);
 		sess_unlink(r, old_i);
 		free_i = old_i;
 	}
 	s = &r->sess[free_i];
 	memset(s, 0, sizeof(*s));
 	s->used = true;
+	s->auth = auth;
 	s->tag = tag;
 	s->ssid = ssid;
 	s->peer = *peer;
@@ -300,25 +326,44 @@ bucket_take(double *tokens, double *last, double rt, double b, double t)
 	return (true);
 }
 
+/* A source, as its bucket is keyed: an IPv4 address mapped, an
+ * IPv4-mapped IPv6 one alike, an IPv6 one's /64. */
+static void
+rl_key(const struct sockaddr *sa, uint8_t a[16])
+{
+	static const uint8_t	mapped[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	    0xff, 0xff };
+	uint16_t		port;
+
+	addr16(sa, a, &port);
+	if (memcmp(a, mapped, sizeof(mapped)) != 0)
+		memset(a + 8, 0, 8);
+}
+
+/* A token for a reply to peer at t, from the buckets of the
+ * authenticated requests when auth (their HMAC verified), else from the
+ * others'. */
 static bool
-rate_ok(struct stamp_refl *r, const struct sockaddr *peer, double t)
+rate_ok(struct stamp_refl *r, const struct sockaddr *peer, double t,
+    bool auth)
 {
 	struct rl	*b, *victim;
 	uint8_t		 a[16];
-	uint16_t	 port;
 	uint32_t	 h;
 	int		 i, set;
 
 	if (r->c.rate > 0) {
-		addr16(peer, a, &port);
+		rl_key(peer, a);
 		h = r->key;
 		for (i = 0; i < 16; i++)
 			h = (h ^ a[i]) * 16777619U;
+		h = (h ^ (auth ? 1U : 0U)) * 16777619U;
 		set = (int)(h % (RL_SLOTS / RL_WAYS)) * RL_WAYS;
 		victim = NULL;
 		for (i = 0; i < RL_WAYS; i++) {
 			b = &r->rl[set + i];
-			if (b->last != 0 && memcmp(b->addr, a, 16) == 0)
+			if (b->last != 0 && b->auth == auth &&
+			    memcmp(b->addr, a, 16) == 0)
 				break;
 			if (victim == NULL || b->last < victim->last)
 				victim = b;
@@ -327,14 +372,17 @@ rate_ok(struct stamp_refl *r, const struct sockaddr *peer, double t)
 			/* New: in the set's oldest, its bucket full. */
 			b = victim;
 			memcpy(b->addr, a, 16);
+			b->auth = auth;
 			b->last = 0;
 		}
 		if (!bucket_take(&b->tokens, &b->last, r->c.rate, r->c.burst,
 		    t))
 			return (false);
 	}
-	if (r->c.rate_total > 0 && !bucket_take(&r->all_tokens, &r->all_last,
-	    r->c.rate_total, r->c.rate_total, t))
+	if (r->c.rate_total > 0 && !(auth ? bucket_take(&r->auth_tokens,
+	    &r->auth_last, r->c.rate_total, r->c.rate_total, t) :
+	    bucket_take(&r->all_tokens, &r->all_last, r->c.rate_total,
+	    r->c.rate_total, t)))
 		return (false);
 	return (true);
 }
@@ -555,10 +603,10 @@ dm_reflect(const struct sess *s, uint8_t *v)
  * 4): the Timestamp Information TLV filled (the clock's source, how T2
  * and T3 are taken), the Class of Service TLV too (cos_reflect()), the
  * Direct Measurement TLV (dm_reflect()) and the Location TLV
- * (loc_reflect()); one of them too short, not as long as its kind is
- * (Class of Service 4, Direct Measurement 12) or whose sub-TLVs go past
- * it marked malformed (M), any other but Extra Padding marked
- * unrecognised (U).  What follows the base is TLVs only when it
+ * (loc_reflect()); one of them not as long as its kind is (Timestamp
+ * Information 4 or more, Class of Service 4, Direct Measurement 12,
+ * Location 4 or more) or whose sub-TLVs go past it marked malformed
+ * (M), any other but Extra Padding marked unrecognised (U).  What follows the base is TLVs only when it
  * is TLVs to its end, none of type 0: anything else is a sender's
  * padding (a TWAMP Light sender's zeros, a pattern), copied as it is.
  */
@@ -609,7 +657,7 @@ tlvs_reflect(struct stamp_refl *r, const struct stamp_rx *rx,
 			break;
 		case STAMP_TLV_TSINFO:
 			if (v.len < 4) {
-				out[at] |= STAMP_TLV_U;
+				out[at] |= STAMP_TLV_M;
 				break;
 			}
 			out[at + 4] = sync;
@@ -687,14 +735,17 @@ refl_core(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *out,
 		port = ntohs(port);
 		if (port == 0 || port == r->c.port)
 			w = STAMP_DROP_PORT;
-		else if (!rate_ok(r, rx->peer, now))
+		else if (!rate_ok(r, rx->peer, now, r->cur_auth))
 			w = STAMP_DROP_RATE;
+		else if (r->c.stateful && (s = sess_get(r, rx->tag, ssid,
+		    &peer, &local, now, true, r->cur_auth)) == NULL)
+			w = STAMP_DROP_FULL;
 	}
 	if (why != NULL)
 		*why = w;
 	/* Over a rate, a session's request is still one it received. */
 	if (w == STAMP_DROP_RATE && r->c.stateful && (s = sess_get(r, rx->tag,
-	    ssid, &peer, &local, now, false)) != NULL)
+	    ssid, &peer, &local, now, false, r->cur_auth)) != NULL)
 		s->rx++;
 	if (w != STAMP_ANSWERED) {
 		r->st.dropped[w]++;
@@ -706,7 +757,6 @@ refl_core(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *out,
 	memcpy(out + STAMP_UNAUTH_LEN, in + STAMP_UNAUTH_LEN, rx->len -
 	    STAMP_UNAUTH_LEN);
 	if (r->c.stateful) {
-		s = sess_get(r, rx->tag, ssid, &peer, &local, now, true);
 		seq = s->seq++;
 		s->rx++;
 		s->tx++;

@@ -3,7 +3,7 @@
 .\"
 .\" Copyright (c) 2026 Pouria Mousavizadeh Tehrani <pouria@FreeBSD.org>
 .\"
-.Dd November 10, 2026
+.Dd November 11, 2026
 .Dt STAMPD 8
 .Os
 .Sh NAME
@@ -87,8 +87,9 @@ came to; a source MAC, which no UDP socket sees, as an EUI-64 of zero;
 none of them with
 .Cm location hide .
 Another TLV but Extra Padding is marked unrecognised (its U flag); a
-Class of Service TLV not of 4 octets, a Direct Measurement TLV not of
-12 or a Location TLV whose sub-TLVs run past it malformed (M).
+Timestamp Information TLV of under 4 octets, a Class of Service TLV not
+of 4, a Direct Measurement TLV not of 12 or a Location TLV of under 4
+or whose sub-TLVs run past it malformed (M).
 What follows the base is taken as TLVs only when it is TLVs to its end,
 none of type 0; anything else, padding, is copied as it is.
 Nor is a packet from port 0 or from
@@ -108,6 +109,13 @@ A request whose HMAC TLV is wrong or missing is answered with its TLVs
 as they came, each flagged I (its integrity failed), none filled.
 A request not authenticated is answered as before, unless
 .Fl A .
+A request whose HMAC verified is limited by rate buckets apart from
+the others', its source's and a total of its own as large as
+.Fl R ,
+so that a flood of requests not authenticated, whose source addresses
+anybody can write, does not make the authenticated sessions look
+lossy; nor does such a request ever replace or count in an
+authenticated session.
 .Pp
 Bound,
 .Nm
@@ -169,7 +177,13 @@ section 4.3.2): a session the FIB, the sender's address and port, the
 address the packet came to, and the SSID, so that the sender tells
 loss on the way out from loss on the way back.
 A session ends after 300 seconds without a packet; 4096 are kept at
-most, the oldest replaced.
+most.
+A session made by an authenticated request is apart from one made by an
+unauthenticated request of the same key.
+When they are all kept, the oldest made unauthenticated is replaced,
+an authenticated one only by an authenticated request and when there
+is none made unauthenticated; a request not authenticated is then
+dropped, and the count of those logged as the rate's is.
 .It Fl P Ar pidfile
 Where to write the process ID.
 .It Fl p Ar port
@@ -177,10 +191,15 @@ The UDP port; default 862.
 .It Fl R Ar rate
 Replies a second to all sources together, its burst as many; default
 2000, 0 for no limit.
+Authenticated requests have a total of their own, as large.
 .It Fl r Ar rate Ns Op / Ns Ar burst
-Replies a second to one source address, a token bucket each, and the
-burst it allows; default 50/100, the burst twice the rate when not
-given, 0 for no limit.
+Replies a second to one source, a token bucket each, and the burst it
+allows; default 50/100, the burst twice the rate when not given, 0 for
+no limit.
+A source is an IPv4 address (an IPv4-mapped IPv6 address alike) or an
+IPv6 /64, one host's or one link's: the senders of a /64 share its
+bucket.
+Authenticated requests have buckets apart.
 The buckets are a table of 4096 keyed by a secret hash, a new source
 taking the oldest of its set, so that no sender chooses whom it
 displaces.
@@ -255,6 +274,35 @@ Read the configuration file and the key file again; its sessions are
 kept unless it becomes stateless.
 A file that cannot be read, or has an error, is logged and the
 configuration kept.
+.It Dv SIGINFO , SIGUSR1
+Log the reflector's counters, a line at
+.Dv LOG_INFO :
+the requests answered, those dropped by reason
+.Pf ( Cm short :
+under 44 octets;
+.Cm port :
+from port 0 or
+.Ar port ;
+.Cm rate :
+over a rate limit;
+.Cm nomem :
+too long to answer;
+.Cm auth :
+failing authentication;
+.Cm unauth :
+not authenticated, with
+.Fl A ;
+.Cm full :
+not authenticated, the sessions all authenticated), those answered
+whose HMAC TLV was wrong
+.Pq Cm tlv_failed
+and the sessions kept, as in
+.Bd -literal -offset indent
+answered=120 dropped: short=0 port=0 rate=3 nomem=0 auth=1 unauth=0
+full=0 tlv_failed=0 sessions=2
+.Ed
+.Pp
+(one line).
 .It Dv SIGTERM , SIGINT
 Log the drops and stop.
 .El

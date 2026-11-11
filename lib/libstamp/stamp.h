@@ -275,6 +275,8 @@ enum stamp_drop {
 	STAMP_DROP_AUTH,		/* authenticated, no key verifying it:
 					   tampered with, or a key not ours */
 	STAMP_DROP_UNAUTH,		/* not authenticated, to auth_only */
+	STAMP_DROP_FULL,		/* not authenticated, the sessions all
+					   authenticated ones */
 	STAMP_DROP_MAX
 };
 

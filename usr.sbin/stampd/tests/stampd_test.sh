@@ -782,6 +782,44 @@ auth_keys_cleanup()
 	stop
 }
 
+atf_test_case stats cleanup
+stats_head()
+{
+	atf_set "descr" "SIGINFO and SIGUSR1: the reflector's counters logged," \
+	    "a line, and it answers still; SIGTERM stops it, its pidfile" \
+	    "removed"
+}
+stats_body()
+{
+	P=$(port)
+	start -p $P
+	atf_check -o match:'^sent=2 received=2 ' "$S" -p $P -c 2 -i 0 127.0.0.1
+	atf_check -s exit:2 -o inline:'none\n' "$S" -p $P -l 43 -W 0.5 \
+	    127.0.0.1
+	kill -INFO "$(cat d.pid)"
+	wait_match 'answered=2 dropped: short=1 port=0 rate=0 nomem=0 auth=0 unauth=0 full=0 tlv_failed=0 sessions=1$' \
+	    cat d.out || atf_fail "no counters: $(cat d.out)"
+	atf_check -o match:'^len=44 ' "$S" -p $P 127.0.0.1
+	kill -USR1 "$(cat d.pid)"
+	wait_match 'answered=3 dropped: short=1 .* sessions=2$' cat d.out ||
+	    atf_fail "no counters: $(cat d.out)"
+	atf_check -o match:'^len=44 ' "$S" -p $P 127.0.0.1
+	[ -f stampd.pid ] || atf_fail "no pidfile"
+	kill "$(cat d.pid)"
+	wait "$(cat d.pid)" 2>/dev/null
+	wait_match 'stopping' cat d.out || atf_fail "not stopped: $(cat d.out)"
+	for i in $(seq 1 50); do
+		[ -f stampd.pid ] || break
+		sleep 0.1
+	done
+	[ ! -f stampd.pid ] || atf_fail "the pidfile left"
+	rm d.pid
+}
+stats_cleanup()
+{
+	stop
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case stateless
@@ -797,4 +835,5 @@ atf_init_test_cases()
 	atf_add_test_case dm_location
 	atf_add_test_case auth
 	atf_add_test_case auth_keys
+	atf_add_test_case stats
 }
