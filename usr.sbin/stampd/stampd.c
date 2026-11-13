@@ -24,9 +24,22 @@
  * logged.
  *
  * SIGINFO and SIGUSR1 log the reflector's counters, a line.
+ *
+ * Started, each descriptor is limited to what it is used for
+ * (cap_rights_limit(2)): the sockets to receive, send to an address
+ * (CAP_CONNECT) and be waited on, the key file to be read again, the
+ * configuration's directory to open the file in it and read it
+ * (fdopen(3) asks F_GETFL), the kqueue to be waited on, the standard
+ * output and error to be written in the foreground, nothing else; no
+ * ioctl, no other fcntl.  Capability mode is not entered: a reflector
+ * answers by sendmsg(2) to the address a request came from, which it
+ * refuses.  The pidfile is pidfile(3)'s, limited by it; run by root,
+ * stampd cannot remove it from root's directory once it is _stampd,
+ * and empties it instead.
  */
 
 #include <sys/param.h>
+#include <sys/capsicum.h>
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -35,6 +48,7 @@
 
 #include <netinet/in.h>
 
+#include <capsicum_helpers.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -82,7 +96,7 @@ static int			 conf_dir = -1;	/* the file's, kept for a reload */
 static char			 conf_name[MAXPATHLEN];
 static bool			 conf_must;	/* -f: it must be there */
 static uint64_t			 drops_told, auth_told, unauth_told;
-static uint64_t			 full_told;
+static uint64_t			 full_told, pre_told;
 static int			 keys_fd = -1;	/* the key file, kept open */
 static const char		*keys_path;
 static struct stamp_key		*keys;
@@ -417,6 +431,11 @@ drops_tell(void)
 		    "the sessions all authenticated",
 		    (uintmax_t)st.dropped[STAMP_DROP_FULL]);
 	full_told = st.dropped[STAMP_DROP_FULL];
+	if (st.dropped[STAMP_DROP_PREAUTH] != pre_told)
+		syslog(LOG_NOTICE, "%ju authenticated requests over their "
+		    "source's rate dropped before any HMAC",
+		    (uintmax_t)st.dropped[STAMP_DROP_PREAUTH]);
+	pre_told = st.dropped[STAMP_DROP_PREAUTH];
 }
 
 /* The reflector's counters, a line (SIGINFO, SIGUSR1). */
@@ -431,6 +450,7 @@ stats_tell(void)
 		[STAMP_DROP_AUTH] = "auth",
 		[STAMP_DROP_UNAUTH] = "unauth",
 		[STAMP_DROP_FULL] = "full",
+		[STAMP_DROP_PREAUTH] = "preauth",
 	};
 	struct stamp_refl_stats	 st;
 	char			 buf[512];
@@ -447,6 +467,74 @@ stats_tell(void)
 	syslog(LOG_INFO, "answered=%ju dropped:%s tlv_failed=%ju sessions=%zu",
 	    (uintmax_t)st.answered, buf, (uintmax_t)st.tlv_failed,
 	    st.sessions);
+}
+
+/* fd limited to rights r, no ioctl, the fcntls of fcntls alone: 0, or
+ * -1 with errno. */
+static int
+limit(int fd, const cap_rights_t *r, uint32_t fcntls)
+{
+
+	if (caph_rights_limit(fd, r) == -1 || caph_ioctls_limit(fd, NULL, 0) ==
+	    -1 || caph_fcntls_limit(fd, fcntls) == -1)
+		return (-1);
+	return (0);
+}
+
+/* Each descriptor limited to what it is used for once started: see the
+ * top of this file.  0, or -1 and why logged. */
+static int
+limit_all(const int *fds, int nfds, int kq, bool debug)
+{
+	cap_rights_t	r;
+	int		i;
+
+	cap_rights_init(&r, CAP_RECV, CAP_SEND, CAP_CONNECT, CAP_EVENT);
+	for (i = 0; i < nfds; i++)
+		if (limit(fds[i], &r, 0) == -1) {
+			syslog(LOG_ERR, "the socket's rights: %m");
+			return (-1);
+		}
+	if (limit(kq, cap_rights_init(&r, CAP_KQUEUE), 0) == -1) {
+		syslog(LOG_ERR, "the kqueue's rights: %m");
+		return (-1);
+	}
+	if (keys_fd != -1 && limit(keys_fd, cap_rights_init(&r, CAP_READ,
+	    CAP_FSTAT, CAP_SEEK), 0) == -1) {
+		syslog(LOG_ERR, "%s: its rights: %m", keys_path);
+		return (-1);
+	}
+	if (conf_dir != -1 && limit(conf_dir, cap_rights_init(&r, CAP_LOOKUP,
+	    CAP_READ, CAP_FSTAT, CAP_FCNTL), CAP_FCNTL_GETFL) == -1) {
+		syslog(LOG_ERR, "%s's directory: its rights: %m", conf_name);
+		return (-1);
+	}
+	if (limit(STDIN_FILENO, cap_rights_init(&r), 0) == -1) {
+		syslog(LOG_ERR, "the standard input's rights: %m");
+		return (-1);
+	}
+	/* In the foreground the log is written to the standard error too. */
+	if (debug)
+		cap_rights_set(&r, CAP_WRITE);
+	if (limit(STDOUT_FILENO, &r, 0) == -1 || limit(STDERR_FILENO, &r,
+	    0) == -1) {
+		syslog(LOG_ERR, "the standard output's rights: %m");
+		return (-1);
+	}
+	return (0);
+}
+
+/* The pidfile removed; when it cannot be (its directory root's, stampd
+ * _stampd), emptied through the descriptor pidfile(3) keeps, so that
+ * rc.subr(8) reads no pid in it. */
+static void
+pid_gone(struct pidfh *pfh)
+{
+
+	if (pfh == NULL)
+		return;
+	(void)ftruncate(pidfile_fileno(pfh), 0);
+	(void)pidfile_remove(pfh);
 }
 
 int
@@ -589,7 +677,7 @@ main(int argc, char *argv[])
 			else
 				syslog(LOG_ERR, "UDP %d in FIB %d (%s): %m", port,
 				    fib, af == AF_INET ? "inet" : "inet6");
-			pidfile_remove(pfh);
+			pid_gone(pfh);
 			exit(1);
 		}
 		fds[nfds++] = fd;
@@ -599,13 +687,13 @@ main(int argc, char *argv[])
 	if (nfds == 0) {
 		syslog(LOG_ERR, "UDP %d in FIB %d: neither inet nor inet6",
 		    port, fib);
-		pidfile_remove(pfh);
+		pid_gone(pfh);
 		exit(1);
 	}
 
 	if (!debug && daemon(0, 0) == -1) {
 		syslog(LOG_ERR, "daemon: %m");
-		pidfile_remove(pfh);
+		pid_gone(pfh);
 		exit(1);
 	}
 	if (pfh != NULL)
@@ -649,6 +737,12 @@ main(int argc, char *argv[])
 		syslog(LOG_ERR, "kevent: %m");
 		exit(1);
 	}
+	if (limit_all(fds, nfds, kq, debug) == -1) {
+		pid_gone(pfh);
+		exit(1);
+	}
+	syslog(LOG_DEBUG, "descriptors limited to their rights, not in "
+	    "capability mode");
 	for (;;) {
 		if ((n = kevent(kq, NULL, 0, kev, nitems(kev), NULL)) == -1) {
 			if (errno == EINTR)
@@ -676,7 +770,7 @@ main(int argc, char *argv[])
 				if (kev[i].ident != SIGHUP) {
 					drops_tell();
 					syslog(LOG_INFO, "stopping");
-					pidfile_remove(pfh);
+					pid_gone(pfh);
 					exit(0);
 				}
 				if (keys_reload(why, sizeof(why)) == -1)

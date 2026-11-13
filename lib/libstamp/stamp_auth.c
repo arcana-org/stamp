@@ -335,8 +335,11 @@ hexval(int c)
 /*
  * Keys from text (len octets): a line each, "ssid key", the SSID 0 to
  * 65535 or "*" for any, the key 32 to 128 hexadecimal digits (16 to 64
- * octets); "#" a comment.  0 and the keys in *keysp (*np of them), or
- * -1 and why in why (a line's number, never a key).
+ * octets); "#" a comment.  STAMP_KEYS_SSID_MAX keys an SSID (a key
+ * rotated, two sessions of one SSID) and STAMP_KEYS_ANY_MAX for any at
+ * most: a reflector makes those HMACs for a request at most.  0 and the keys
+ * in *keysp (*np of them), or -1 and why in why (a line's number, never
+ * a key).
  */
 int
 stamp_keys_parse(const char *text, size_t len, struct stamp_key **keysp,
@@ -344,7 +347,7 @@ stamp_keys_parse(const char *text, size_t len, struct stamp_key **keysp,
 {
 	struct stamp_key	*keys = NULL, *nk;
 	const char		*p = text, *end = text + len, *eol, *w, *e;
-	size_t			 n = 0, cap = 0, i, wl;
+	size_t			 n = 0, cap = 0, i, wl, same;
 	long			 ssid;
 	int			 line = 0, hi, lo;
 	char			 num[8];
@@ -394,6 +397,21 @@ stamp_keys_parse(const char *text, size_t len, struct stamp_key **keysp,
 		if (n == STAMP_KEYS_MAX) {
 			(void)snprintf(why, whylen, "line %d: more than %d keys",
 			    line, STAMP_KEYS_MAX);
+			stamp_keys_free(keys, cap);
+			return (-1);
+		}
+		for (i = same = 0; i < n; i++)
+			if (keys[i].ssid == ssid)
+				same++;
+		if (ssid == STAMP_SSID_ANY && same == STAMP_KEYS_ANY_MAX) {
+			(void)snprintf(why, whylen, "line %d: more than %d keys "
+			    "for any SSID", line, STAMP_KEYS_ANY_MAX);
+			stamp_keys_free(keys, cap);
+			return (-1);
+		}
+		if (ssid != STAMP_SSID_ANY && same == STAMP_KEYS_SSID_MAX) {
+			(void)snprintf(why, whylen, "line %d: more than %d keys "
+			    "for SSID %ld", line, STAMP_KEYS_SSID_MAX, ssid);
 			stamp_keys_free(keys, cap);
 			return (-1);
 		}
@@ -448,16 +466,19 @@ bad:
 /*
  * The keys of an open file (stamp_keys_parse()), read from its start:
  * a regular file its owner alone may read or write (no group or other
- * bits), owned by root or by this process's user.  0, or -1 and why.
+ * bits), owned by root or by this process's user.  Read whole or not at
+ * all: an error reading it, fewer octets than its size, or its size or
+ * modification time changed meanwhile (rewritten while read) fail it,
+ * never a smaller set of keys.  0, or -1 and why.
  */
 int
 stamp_keys_read(int fd, struct stamp_key **keysp, size_t *np, char *why,
     size_t whylen)
 {
-	struct stat	 st;
+	struct stat	 st, after;
 	char		*buf;
 	size_t		 got = 0;
-	ssize_t		 r;
+	ssize_t		 r = 0;
 	int		 rc;
 
 	*keysp = NULL;
@@ -489,10 +510,27 @@ stamp_keys_read(int fd, struct stamp_key **keysp, size_t *np, char *why,
 		(void)snprintf(why, whylen, "%s", strerror(errno));
 		return (-1);
 	}
-	while (got < (size_t)st.st_size && (r = pread(fd, buf + got,
-	    (size_t)st.st_size - got, (off_t)got)) > 0)
+	rc = -1;
+	while (got < (size_t)st.st_size) {
+		if ((r = pread(fd, buf + got, (size_t)st.st_size - got,
+		    (off_t)got)) == -1 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
 		got += (size_t)r;
-	rc = stamp_keys_parse(buf, got, keysp, np, why, whylen);
+	}
+	if (got < (size_t)st.st_size && r == -1)
+		(void)snprintf(why, whylen, "%s", strerror(errno));
+	else if (got < (size_t)st.st_size)
+		(void)snprintf(why, whylen, "%zu of its %jd octets read", got,
+		    (intmax_t)st.st_size);
+	else if (fstat(fd, &after) == -1)
+		(void)snprintf(why, whylen, "%s", strerror(errno));
+	else if (after.st_size != st.st_size || timespeccmp(&after.st_mtim,
+	    &st.st_mtim, !=))
+		(void)snprintf(why, whylen, "changed while it was read");
+	else
+		rc = stamp_keys_parse(buf, got, keysp, np, why, whylen);
 	explicit_bzero(buf, (size_t)st.st_size + 1);
 	free(buf);
 	return (rc);

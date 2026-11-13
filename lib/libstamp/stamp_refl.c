@@ -43,22 +43,41 @@
  * (its source's, and a total of its own as large), so that whoever
  * writes source addresses does not starve the authenticated sessions.
  *
+ * Nor is the reflector made to spend its time on HMACs.  A request of
+ * the authenticated layout costs one for each of its SSID's keys (looked
+ * up by it, STAMP_KEYS_SSID_MAX at most: two while one is rotated, or
+ * two sessions whose SSIDs, derived, are the same) and one for each key
+ * for any SSID (STAMP_KEYS_ANY_MAX at most), 8 at most, whatever the
+ * keys; and before any it draws a token from
+ * its source's bucket of a class of its own, as large as its source's
+ * (STAMP_DROP_PREAUTH when there is none), given back when the HMAC
+ * verifies: the failures use it up, never the requests answered.
+ * Whoever writes a sender's source address can drain it, as it can
+ * that address's bucket of unauthenticated requests, and so starve the
+ * sender's authenticated requests while it sends more failures than
+ * the source's rate; but it touches no bucket of those verified, and
+ * its flood costs the HMACs of that rate, where it cost those of every
+ * key that might verify for each packet and, fast enough, every
+ * session the CPU.  A flood of many sources costs a packet's at most.
+ * No total of such tokens: one would let whoever writes any address
+ * starve every authenticated session.
+ *
  * The authenticated mode (RFC 8762 4.4): a request of its layout
- * (stamp_auth_layout()) is answered only when its HMAC verifies under a
- * key of the reflector's for its SSID, or for any SSID, the first that
- * does; otherwise it is dropped and counted (STAMP_DROP_AUTH), never
- * answered.  Its reply is of the same layout under the same key, its
- * HMAC made by stamp_refl_finish() once T3 is in.  What follows its
- * base must be well-formed TLVs to its end (no octets left over, no
- * header cut short, no length overlong, none of type 0), else it is
- * dropped as one failing authentication: nothing of it was protected,
- * and nothing can be flagged.  Its TLVs are looked at when RFC 8972's
- * HMAC TLV over them verifies (Extra Padding TLVs alone need none);
- * when it does not, or is missing, the reply carries them as they
- * came, each flagged I (4.8), and the HMAC TLV made again over
- * them.  A request of the unauthenticated layout
- * is answered as before, unless the reflector is authenticated only
- * (STAMP_DROP_UNAUTH).
+ * (stamp_auth_layout()) is answered only when its HMAC verifies under
+ * one of the reflector's keys for its SSID, or else under one for any
+ * SSID, the first that does in the order they came; otherwise it is
+ * dropped and counted
+ * (STAMP_DROP_AUTH), never answered.  Its reply is of the same layout
+ * under the same key, its HMAC made by stamp_refl_finish() once T3 is
+ * in.  What follows its base must be well-formed TLVs to its end (no
+ * octets left over, no header cut short, no length overlong, none of
+ * type 0), else it is dropped as one failing authentication: nothing of
+ * it was protected, and nothing can be flagged.  Its TLVs are looked at
+ * when RFC 8972's HMAC TLV over them verifies (Extra Padding TLVs alone
+ * need none); when it does not, or is missing, the reply carries them
+ * as they came, each flagged I (4.8), and the HMAC TLV made again over
+ * them.  A request of the unauthenticated layout is answered as before,
+ * unless the reflector is authenticated only (STAMP_DROP_UNAUTH).
  */
 
 #include <sys/types.h>
@@ -91,9 +110,15 @@ struct sess {
 	int			 next;		/* in its bucket; -1 the end */
 };
 
+/* A source's buckets, one a class. */
+#define	RL_UNAUTH	0		/* the unauthenticated requests' */
+#define	RL_AUTH		1		/* those whose HMAC verified */
+#define	RL_PRE		2		/* the authenticated layout's, before
+					   any HMAC */
+
 struct rl {
 	uint8_t		 addr[16];	/* rl_key()'s */
-	bool		 auth;		/* the authenticated requests' */
+	uint8_t		 cls;		/* RL_* */
 	double		 tokens;
 	double		 last;		/* 0: unused */
 };
@@ -112,10 +137,11 @@ struct stamp_refl {
 	double			 clk_at;
 	struct stamp_refl_stats	 st;
 	int			 reply_tos;	/* the last reply's; -1 */
-	/* The authenticated mode: the keys, the request narrowed, and
-	 * what the request being answered and the last reply are. */
+	/* The authenticated mode: the keys (those for any SSID first, nany
+	 * of them, then by SSID), the request narrowed, and what the
+	 * request being answered and the last reply are. */
 	struct stamp_key	*keys;
-	size_t			 nkeys;
+	size_t			 nkeys, nany;
 	uint8_t			*view;		/* STAMP_PKT_MAX */
 	bool			 cur_auth, cur_tlv_bad;
 	const struct stamp_key	*reply_key;	/* NULL: unauthenticated */
@@ -340,6 +366,37 @@ rl_key(const struct sockaddr *sa, uint8_t a[16])
 		memset(a + 8, 0, 8);
 }
 
+/* peer's bucket of class cls, made if new: in the set's oldest, full. */
+static struct rl *
+rl_get(struct stamp_refl *r, const struct sockaddr *peer, uint8_t cls)
+{
+	struct rl	*b, *victim;
+	uint8_t		 a[16];
+	uint32_t	 h;
+	int		 i, set;
+
+	rl_key(peer, a);
+	h = r->key;
+	for (i = 0; i < 16; i++)
+		h = (h ^ a[i]) * 16777619U;
+	h = (h ^ cls) * 16777619U;
+	set = (int)(h % (RL_SLOTS / RL_WAYS)) * RL_WAYS;
+	victim = NULL;
+	for (i = 0; i < RL_WAYS; i++) {
+		b = &r->rl[set + i];
+		if (b->last != 0 && b->cls == cls && memcmp(b->addr, a, 16) ==
+		    0)
+			return (b);
+		if (victim == NULL || b->last < victim->last)
+			victim = b;
+	}
+	b = victim;
+	memcpy(b->addr, a, 16);
+	b->cls = cls;
+	b->last = 0;
+	return (b);
+}
+
 /* A token for a reply to peer at t, from the buckets of the
  * authenticated requests when auth (their HMAC verified), else from the
  * others'. */
@@ -347,34 +404,10 @@ static bool
 rate_ok(struct stamp_refl *r, const struct sockaddr *peer, double t,
     bool auth)
 {
-	struct rl	*b, *victim;
-	uint8_t		 a[16];
-	uint32_t	 h;
-	int		 i, set;
+	struct rl	*b;
 
 	if (r->c.rate > 0) {
-		rl_key(peer, a);
-		h = r->key;
-		for (i = 0; i < 16; i++)
-			h = (h ^ a[i]) * 16777619U;
-		h = (h ^ (auth ? 1U : 0U)) * 16777619U;
-		set = (int)(h % (RL_SLOTS / RL_WAYS)) * RL_WAYS;
-		victim = NULL;
-		for (i = 0; i < RL_WAYS; i++) {
-			b = &r->rl[set + i];
-			if (b->last != 0 && b->auth == auth &&
-			    memcmp(b->addr, a, 16) == 0)
-				break;
-			if (victim == NULL || b->last < victim->last)
-				victim = b;
-		}
-		if (i == RL_WAYS) {
-			/* New: in the set's oldest, its bucket full. */
-			b = victim;
-			memcpy(b->addr, a, 16);
-			b->auth = auth;
-			b->last = 0;
-		}
+		b = rl_get(r, peer, auth ? RL_AUTH : RL_UNAUTH);
 		if (!bucket_take(&b->tokens, &b->last, r->c.rate, r->c.burst,
 		    t))
 			return (false);
@@ -387,6 +420,124 @@ rate_ok(struct stamp_refl *r, const struct sockaddr *peer, double t,
 	return (true);
 }
 
+/*
+ * A token for an HMAC of a request of the authenticated layout from
+ * peer at t, before any is made, from its source's bucket of RL_PRE:
+ * false when there is none; *bp the bucket, for pre_refund(), NULL when
+ * a source has no limit.
+ */
+static bool
+pre_take(struct stamp_refl *r, const struct sockaddr *peer, double t,
+    struct rl **bp)
+{
+	struct rl	*b;
+
+	*bp = NULL;
+	if (r->c.rate <= 0)
+		return (true);
+	b = rl_get(r, peer, RL_PRE);
+	if (!bucket_take(&b->tokens, &b->last, r->c.rate, r->c.burst, t))
+		return (false);
+	*bp = b;
+	return (true);
+}
+
+/* Its token given back: the HMAC verified. */
+static void
+pre_refund(const struct stamp_refl *r, struct rl *b)
+{
+
+	if (b != NULL && (b->tokens += 1) > r->c.burst)
+		b->tokens = r->c.burst;
+}
+
+/* ---- Keys ------------------------------------------------------- */
+
+static int
+key_cmp(const void *a, const void *b)
+{
+	int32_t	x = ((const struct stamp_key *)a)->ssid;
+	int32_t	y = ((const struct stamp_key *)b)->ssid;
+
+	return (x < y ? -1 : x > y);
+}
+
+/*
+ * The keys of a configuration copied into *kp: those for any SSID first,
+ * as they came (*nanyp of them, STAMP_KEYS_ANY_MAX at most), then by
+ * SSID, an SSID's as they came (STAMP_KEYS_SSID_MAX at most); more:
+ * E2BIG, an SSID past 65535: EINVAL.  0, or -1 with errno.
+ */
+static int
+keys_index(const struct stamp_key *keys, size_t n, struct stamp_key **kp,
+    size_t *nanyp)
+{
+	struct stamp_key	*k;
+	size_t			 i, j, nany, run;
+
+	*kp = NULL;
+	*nanyp = 0;
+	for (i = nany = 0; i < n; i++)
+		if (keys[i].ssid == STAMP_SSID_ANY)
+			nany++;
+		else if (keys[i].ssid < 0 || keys[i].ssid > 65535) {
+			errno = EINVAL;
+			return (-1);
+		}
+	if (nany > STAMP_KEYS_ANY_MAX) {
+		errno = E2BIG;
+		return (-1);
+	}
+	if (n == 0)
+		return (0);
+	if ((k = calloc(n, sizeof(*k))) == NULL)
+		return (-1);
+	for (i = 0, j = nany, nany = 0; i < n; i++)
+		if (keys[i].ssid == STAMP_SSID_ANY)
+			k[nany++] = keys[i];
+		else
+			k[j++] = keys[i];
+	/* Stable: an SSID's keys tried in the order they came. */
+	if (n - nany > 1 && mergesort(k + nany, n - nany, sizeof(*k),
+	    key_cmp) == -1) {
+		stamp_keys_free(k, n);
+		return (-1);
+	}
+	for (i = nany, run = 0; i < n; i++) {
+		run = i > nany && k[i].ssid == k[i - 1].ssid ? run + 1 : 1;
+		if (run > STAMP_KEYS_SSID_MAX) {
+			stamp_keys_free(k, n);
+			errno = E2BIG;
+			return (-1);
+		}
+	}
+	*kp = k;
+	*nanyp = nany;
+	return (0);
+}
+
+/* The first key of SSID ssid, *np of them, else NULL. */
+static const struct stamp_key *
+key_find(const struct stamp_refl *r, uint16_t ssid, size_t *np)
+{
+	const struct stamp_key	*f, *l, *end = r->keys + r->nkeys;
+	struct stamp_key	 k;
+
+	*np = 0;
+	if (r->nkeys == r->nany)
+		return (NULL);
+	k.ssid = ssid;
+	if ((f = bsearch(&k, r->keys + r->nany, r->nkeys - r->nany,
+	    sizeof(k), key_cmp)) == NULL)
+		return (NULL);
+	while (f > r->keys + r->nany && f[-1].ssid == ssid)
+		f--;
+	for (l = f; l < end && l->ssid == ssid; l++)
+		;
+	*np = (size_t)(l - f);
+	return (f);
+}
+
 /* ---- The reflector ---------------------------------------------- */
 
 int
@@ -395,6 +546,7 @@ stamp_refl_setconf(struct stamp_refl *r, const struct stamp_refl_conf *c)
 	struct stamp_refl_conf	 n = *c;
 	struct stamp_key	*k = NULL;
 	struct sess		*s;
+	size_t			 nany;
 	unsigned		 i;
 
 	/* The keys, copied first: nothing changed when they cannot be. */
@@ -402,11 +554,8 @@ stamp_refl_setconf(struct stamp_refl *r, const struct stamp_refl_conf *c)
 		errno = E2BIG;
 		return (-1);
 	}
-	if (n.nkeys > 0) {
-		if ((k = calloc(n.nkeys, sizeof(*k))) == NULL)
-			return (-1);
-		memcpy(k, n.keys, n.nkeys * sizeof(*k));
-	}
+	if (keys_index(n.keys, n.nkeys, &k, &nany) == -1)
+		return (-1);
 	if (n.nkeys > 0 && r->view == NULL && (r->view =
 	    malloc(STAMP_PKT_MAX)) == NULL) {
 		stamp_keys_free(k, n.nkeys);
@@ -439,6 +588,7 @@ stamp_refl_setconf(struct stamp_refl *r, const struct stamp_refl_conf *c)
 	stamp_keys_free(r->keys, r->nkeys);
 	r->keys = k;
 	r->nkeys = n.nkeys;
+	r->nany = nany;
 	r->reply_key = NULL;
 	n.keys = k;
 	r->c = n;
@@ -798,26 +948,36 @@ refl_drop(struct stamp_refl *r, enum stamp_drop w, enum stamp_drop *why)
 
 /*
  * A request of the authenticated layout: its key the first of its
- * SSID's, or any's, its HMAC verifies under; the core's reply to it
+ * SSID's, else of those for any SSID, its HMAC verifies under, a token
+ * of its source's
+ * taken before the first HMAC (pre_take()); the core's reply to it
  * narrowed, widened again, its HMAC TLV made.
  */
 static ssize_t
 refl_auth(struct stamp_refl *r, const struct stamp_rx *rx, uint8_t *out,
     size_t outlen, enum stamp_drop *why)
 {
-	const struct stamp_key	*k = NULL;
+	const struct stamp_key	*k = NULL, *own;
 	struct stamp_rx		 nrx;
-	uint16_t		 ssid;
+	struct rl		*b;
 	ssize_t			 n;
-	size_t			 i;
+	size_t			 i, nown;
 
-	ssid = stamp_auth_ssid(rx->pkt);
-	for (i = 0; i < r->nkeys && k == NULL; i++)
-		if ((r->keys[i].ssid == STAMP_SSID_ANY || r->keys[i].ssid ==
-		    ssid) && stamp_auth_verify(&r->keys[i], rx->pkt, rx->len))
+	own = key_find(r, stamp_auth_ssid(rx->pkt), &nown);
+	if (own == NULL && r->nany == 0)
+		return (refl_drop(r, STAMP_DROP_AUTH, why));
+	if (!pre_take(r, rx->peer, rx->mono != 0 ? rx->mono : stamp_mono(),
+	    &b))
+		return (refl_drop(r, STAMP_DROP_PREAUTH, why));
+	for (i = 0; i < nown && k == NULL; i++)
+		if (stamp_auth_verify(&own[i], rx->pkt, rx->len))
+			k = &own[i];
+	for (i = 0; i < r->nany && k == NULL; i++)
+		if (stamp_auth_verify(&r->keys[i], rx->pkt, rx->len))
 			k = &r->keys[i];
 	if (k == NULL)
 		return (refl_drop(r, STAMP_DROP_AUTH, why));
+	pre_refund(r, b);
 	if (rx->len > outlen || rx->len > STAMP_PKT_MAX)
 		return (refl_drop(r, STAMP_DROP_NOMEM, why));
 	switch (stamp_auth_tlv_verify(k, rx->pkt, rx->len, STAMP_AUTH_LEN)) {

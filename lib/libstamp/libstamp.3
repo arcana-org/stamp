@@ -3,7 +3,7 @@
 .\"
 .\" Copyright (c) 2026 Pouria Mousavizadeh Tehrani <pouria@FreeBSD.org>
 .\"
-.Dd November 11, 2026
+.Dd November 13, 2026
 .Dt LIBSTAMP 3
 .Os
 .Sh NAME
@@ -429,6 +429,15 @@ A request whose HMAC verified draws from buckets apart, its source's
 and a total of its own as large, so that unauthenticated requests,
 whose source addresses anybody writes, do not starve the authenticated
 ones.
+A request of the authenticated layout takes a token from a bucket of
+its source's of its own, of this rate and burst, before any HMAC is
+made, given back when the HMAC verifies: failures past the rate are
+dropped before an HMAC
+.Pq Dv STAMP_DROP_PREAUTH ,
+those answered never use it up.
+Whoever writes a sender's address can drain it, as it can that
+address's bucket of unauthenticated requests, but not the buckets of
+the requests verified; no total of such tokens is kept.
 .It Va sess_max , sess_idle
 Sessions kept at most
 .Pq Dv STAMP_SESS_MAX , No 4096
@@ -459,7 +468,20 @@ A Location TLV's ports and addresses are not said (zero), as RFC 8972
 lets a reflector's policy.
 .It Va keys , nkeys
 The keys of the authenticated mode, copied
-.Pq at most Dv STAMP_KEYS_MAX : No see Sx The authenticated mode .
+.Pq at most Dv STAMP_KEYS_MAX : No see Sx The authenticated mode :
+at most
+.Dv STAMP_KEYS_SSID_MAX
+(4) an SSID, tried in their order, and at most
+.Dv STAMP_KEYS_ANY_MAX
+(4) for any SSID, tried after them; more, and
+.Fn stamp_refl_new
+and
+.Fn stamp_refl_setconf
+fail with
+.Er E2BIG ,
+an SSID past 65535 with
+.Er EINVAL ,
+and nothing is changed.
 .It Va auth_only
 A request that is not of the authenticated layout is not answered
 .Pq Dv STAMP_DROP_UNAUTH .
@@ -511,11 +533,12 @@ the request's DSCP; \-1 (the socket's own) when the request had no
 such TLV, or its TOS is not known.
 A packet shorter than the base, from port 0 or the reflector's own,
 over a rate limit, authenticated with no key that verifies it, not
-authenticated to a reflector authenticated only, or not authenticated
-to a stateful one whose sessions are all authenticated, is not
+authenticated to a reflector authenticated only, not authenticated
+to a stateful one whose sessions are all authenticated, or
+authenticated past its source's rate before its HMAC, is not
 answered: \-1, why in
 .Fa *why
-.Pq Dv STAMP_DROP_SHORT , STAMP_DROP_PORT , STAMP_DROP_RATE , STAMP_DROP_AUTH , STAMP_DROP_UNAUTH , STAMP_DROP_FULL ,
+.Pq Dv STAMP_DROP_SHORT , STAMP_DROP_PORT , STAMP_DROP_RATE , STAMP_DROP_AUTH , STAMP_DROP_UNAUTH , STAMP_DROP_FULL , STAMP_DROP_PREAUTH ,
 counted.
 The caller sets the reply's own timestamp (T3) as late as it can with
 .Fn stamp_refl_finish ,
@@ -735,8 +758,10 @@ The reflector answers a request of that layout
 .Pf ( Fn stamp_auth_layout :
 112 octets or more, the twelve after the Sequence Number zero, where
 the unauthenticated layout has its timestamp) only when its HMAC
-verifies under a key of its SSID's or of any SSID's, the first that
-does; its reply is of the same layout under the same key.
+verifies under one of its SSID's keys, or else under one of any
+SSID's, the first that does, one HMAC each, eight at most; its reply
+is of the same
+layout under the same key.
 A request whose HMAC no key verifies, or after whose base come octets
 that are not well-formed TLVs to its end (left over, a header cut
 short, a length past the packet, a TLV of type 0), is dropped and
@@ -797,10 +822,19 @@ the SSID 0 to 65535 or
 for any, the key 32 to 128 hexadecimal digits;
 .Ql #
 begins a comment.
+An SSID has
+.Dv STAMP_KEYS_SSID_MAX
+keys at most (a key rotated is two keys of its SSID for a while, the
+old and the new), and
+.Dv STAMP_KEYS_ANY_MAX
+at most are for any; one more for an SSID, or for any, is an error.
 An error says the line's number, never a key.
 .Fn stamp_keys_read
 reads them from an open file, from its start: a regular file its owner
 alone may read and write, owned by root or by the process's user.
+It is read whole or not at all: an error reading it, fewer octets than
+its size, or a size or modification time changed while it was read
+fail it, never a smaller set of keys.
 .Fn stamp_keys_free
 zeroes the keys and frees them.
 .Ss Sockets

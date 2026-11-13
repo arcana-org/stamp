@@ -46,6 +46,8 @@
 #define	STAMP_KEY_MIN		16	/* octets */
 #define	STAMP_KEY_MAX		64
 #define	STAMP_KEYS_MAX		4096	/* in a file, a reflector */
+#define	STAMP_KEYS_SSID_MAX	4	/* of them for one SSID */
+#define	STAMP_KEYS_ANY_MAX	4	/* of them for any SSID */
 #define	STAMP_SSID_ANY		(-1)
 
 /* A key and the sessions it is for: those of its SSID, or any. */
@@ -241,8 +243,10 @@ struct stamp_refl_conf {
 	 * RFC 8972 4.2 lets a reflector's policy. */
 	bool		 loc_hide;
 	/* The keys of the authenticated mode (copied): a request of its
-	 * layout answered when one for its SSID, or for any, verifies;
-	 * auth_only, one of the unauthenticated layout never. */
+	 * layout answered when one of its SSID's, or one for any,
+	 * verifies; STAMP_KEYS_SSID_MAX an SSID and STAMP_KEYS_ANY_MAX
+	 * for any at most; auth_only, one of the unauthenticated layout
+	 * never. */
 	const struct stamp_key *keys;
 	size_t		 nkeys;
 	bool		 auth_only;
@@ -277,6 +281,8 @@ enum stamp_drop {
 	STAMP_DROP_UNAUTH,		/* not authenticated, to auth_only */
 	STAMP_DROP_FULL,		/* not authenticated, the sessions all
 					   authenticated ones */
+	STAMP_DROP_PREAUTH,		/* authenticated, over its source's
+					   rate before any HMAC */
 	STAMP_DROP_MAX
 };
 

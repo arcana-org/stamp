@@ -20,7 +20,9 @@ a Session-Reflector daemon and a sender.
   Session-Reflector's core (stateless or stateful sessions, per-source
   (an IPv6 /64 one source) and global rate limits, the authenticated
   requests' apart, their sessions never replaced by unauthenticated
-  ones, the reply), the Session-Sender's core (a
+  ones, those failing authentication limited before any HMAC, four
+  keys an SSID (a key rotated is two) and four for any, eight HMACs a
+  request at most, the reply), the Session-Sender's core (a
   session's sequence, the replies matched, the round trip with the
   reflector's time taken out, the delay each way when both Error
   Estimates say synchronised and their errors together are within a
@@ -39,8 +41,11 @@ a Session-Reflector daemon and a sender.
   read again on `SIGHUP`; its counters logged on `SIGINFO` or
   `SIGUSR1`; syslog. Keys from `stampd.keys` (`-K`), a
   file root alone reads, read before root is given up and kept open,
-  read again on `SIGHUP`; a request whose HMAC no key verifies dropped
-  and counted, never answered; `-A` answers only authenticated ones.
+  read again on `SIGHUP`, whole or not at all; a request whose HMAC no
+  key verifies dropped and counted, never answered; `-A` answers only
+  authenticated ones.  Each descriptor limited to its rights by
+  `cap_rights_limit(2)`; not in capability mode, which refuses a reply
+  sent to an address.
 - **stamp(1)**: send N test packets at an interval, print each reply's
   fields, the round trip and the delay each way (`-T` asks for the
   Timestamp Information TLV, `-D` for the Class of Service TLV: the

@@ -3,7 +3,7 @@
 .\"
 .\" Copyright (c) 2026 Pouria Mousavizadeh Tehrani <pouria@FreeBSD.org>
 .\"
-.Dd November 11, 2026
+.Dd November 13, 2026
 .Dt STAMPD 8
 .Os
 .Sh NAME
@@ -102,9 +102,10 @@ octets or more, its fields apart and an HMAC of its first 96 octets,
 HMAC-SHA-256 truncated to 128 bits, and RFC 8972's HMAC TLV after its
 other TLVs.
 It is answered, under the same key, only when its HMAC verifies under
-a key of the key file for its SSID, or for any SSID, and what follows
-its base is well-formed TLVs to its end; otherwise it is dropped,
-never answered, and the count of those is logged as the rate's is.
+the key of the key file for its SSID, or else under one for any SSID,
+and what follows its base is well-formed TLVs to its end; otherwise it
+is dropped, never answered, and the count of those is logged as the
+rate's is.
 A request whose HMAC TLV is wrong or missing is answered with its TLVs
 as they came, each flagged I (its integrity failed), none filled.
 A request not authenticated is answered as before, unless
@@ -117,6 +118,28 @@ anybody can write, does not make the authenticated sessions look
 lossy; nor does such a request ever replace or count in an
 authenticated session.
 .Pp
+Nor can a flood of requests that only look authenticated make
+.Nm
+spend its time on HMACs.
+A request costs one HMAC for each of its SSID's keys and one for each
+key for any SSID, eight at most
+.Pq see Sx KEYS ,
+and before any it takes a token from a bucket of its source's of its
+own, of
+.Fl r Ns 's
+rate and burst, given back when the HMAC verifies: requests failing
+authentication from a source past that rate are dropped before any
+HMAC, and counted
+.Pq Cm preauth ,
+those answered never use it up.
+Whoever writes a sender's address can so starve that sender's
+authenticated requests, as it can its unauthenticated ones, while it
+sends more failures than the rate; it cannot touch the buckets of the
+requests verified, and no total of such tokens is kept, which would
+let a flood from any address starve every authenticated session.
+.Fl r No 0
+sets no such limit either.
+.Pp
 Bound,
 .Nm
 writes its pidfile and, run by root, gives up root: it changes its
@@ -125,6 +148,30 @@ root to
 and runs as
 .Ar user
 (and its group).
+Then each descriptor is limited to what it is used for
+.Pq Xr cap_rights_limit 2 :
+the sockets to receive, to send to an address and to be waited on,
+the key file to be read again, the configuration file's directory to
+open and read the file in it, the kqueue to be waited on, the standard
+output and error to be written in the foreground
+.Pq Fl d ,
+nothing else; no
+.Xr ioctl 2 ,
+no
+.Xr fcntl 2
+but
+.Dv F_GETFL
+on the configuration file.
+It does not enter capability mode
+.Pq Xr cap_enter 2 ,
+which refuses
+.Xr sendmsg 2
+to an address, and a reflector answers each request to the address it
+came from.
+Run by root, it cannot remove its pidfile from root's directory once
+it is
+.Ar user ,
+and empties it when it stops instead.
 .Pp
 The options are as follows:
 .Bl -tag -width "-r rate[/burst]"
@@ -196,6 +243,8 @@ Authenticated requests have a total of their own, as large.
 Replies a second to one source, a token bucket each, and the burst it
 allows; default 50/100, the burst twice the rate when not given, 0 for
 no limit.
+Requests failing authentication have a bucket of the same apart,
+taken before any HMAC.
 A source is an IPv4 address (an IPv4-mapped IPv6 address alike) or an
 IPv6 /64, one host's or one link's: the senders of a /64 share its
 bucket.
@@ -245,8 +294,13 @@ the SSID of the sessions it is for, 0 to 65535, or
 for any, and the key, 32 to 128 hexadecimal digits (16 to 64 octets);
 .Ql #
 starts a comment.
-A request's key is the first of its SSID's, or of any SSID's, under
-which its HMAC verifies.
+An SSID has four keys at most, and four at most are for any SSID, so
+that a request costs eight HMACs at most; a file with a fifth key for
+an SSID, or a fifth for any, is refused, its line said.
+A key is rotated by two keys of its SSID for a while, the old and the
+new; two sessions whose SSIDs are the same have a key each.
+A request's key is the first of its SSID's, in the file's order, or
+else the first for any SSID, under which its HMAC verifies.
 The file must be a regular file its owner alone may read and write
 (mode 0600 at most), owned by root (or by the user that runs
 .Nm
@@ -262,8 +316,14 @@ place (truncated and written, as the shell's
 .Ql >
 does), not replaced by another file, which a reload cannot open once
 root is given up.
+It is read whole or not at all: an error reading it, fewer octets than
+its size, or a size or modification time changed while it was read (a
+rewrite meanwhile) fails it, never a smaller set of keys.
 A file replaced, or one that cannot be read or has an error, is logged
 and the keys kept as they were; a restart reads it.
+At start such a file keeps
+.Nm
+from starting, the error said.
 A key file made while
 .Nm
 runs without one is read when it is started again.
@@ -293,13 +353,15 @@ failing authentication;
 not authenticated, with
 .Fl A ;
 .Cm full :
-not authenticated, the sessions all authenticated), those answered
-whose HMAC TLV was wrong
+not authenticated, the sessions all authenticated;
+.Cm preauth :
+of the authenticated layout, over its source's rate before any HMAC),
+those answered whose HMAC TLV was wrong
 .Pq Cm tlv_failed
 and the sessions kept, as in
 .Bd -literal -offset indent
 answered=120 dropped: short=0 port=0 rate=3 nomem=0 auth=1 unauth=0
-full=0 tlv_failed=0 sessions=2
+full=0 preauth=0 tlv_failed=0 sessions=2
 .Ed
 .Pp
 (one line).
@@ -374,6 +436,7 @@ setfib 2 stampd -d -m stateless
 .Sh SEE ALSO
 .Xr setfib 1 ,
 .Xr stamp 1 ,
+.Xr cap_rights_limit 2 ,
 .Xr libstamp 3 ,
 .Xr rc.conf 5 ,
 .Xr rc.subr 8

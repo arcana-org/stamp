@@ -401,6 +401,15 @@ privileges_body()
 	wait_match 'reloaded' cat d.out || atf_fail "$(cat d.out)"
 	atf_check -s exit:1 -e match:'no user no_such_stampd_user' \
 	    "$D" -d -p $P -u no_such_stampd_user
+	# Stopped: its pidfile, in root's directory, emptied if not removed.
+	kill $pid
+	wait_match 'stopping' cat d.out || atf_fail "not stopped: $(cat d.out)"
+	for i in $(seq 1 50); do
+		[ -s stampd.pid ] || break
+		sleep 0.1
+	done
+	[ ! -s stampd.pid ] || atf_fail "its pid left: $(cat stampd.pid)"
+	rm d.pid
 }
 privileges_cleanup()
 {
@@ -782,6 +791,89 @@ auth_keys_cleanup()
 	stop
 }
 
+atf_test_case auth_flood cleanup
+auth_flood_head()
+{
+	atf_set "descr" "Requests failing authentication from one source:" \
+	    "past its rate, dropped before any HMAC and counted (preauth)," \
+	    "its own requests with them, until its bucket fills again; with" \
+	    "-r 0, none so dropped"
+	atf_set "timeout" "60"
+}
+auth_flood_body()
+{
+	umask 077
+	keyfile k1 9
+	keyfile k2 9
+	P=$(port)
+	start -p $P -r 2/4 -K "$(pwd)/k1"
+	"$S" -p $P -K k2 -c 20 -i 0 -W 0.05 127.0.0.1 > flood.out
+	atf_check -o inline:'20\n' grep -c '^none$' flood.out
+	kill -INFO "$(cat d.pid)"
+	wait_match ' auth=[4-7] unauth=0 full=0 preauth=1[3-6] tlv_failed=0 ' \
+	    cat d.out || atf_fail "not counted: $(cat d.out)"
+	wait_match '[0-9]+ authenticated requests over their source.s rate dropped before any HMAC' \
+	    cat d.out || atf_fail "not said: $(cat d.out)"
+	# Its own, a second on: answered.
+	sleep 1
+	atf_check -o match:'^len=112 ' "$S" -p $P -K k1 127.0.0.1
+	stop
+	start -p $P -r 0 -K "$(pwd)/k1"
+	"$S" -p $P -K k2 -c 20 -i 0 -W 0.05 127.0.0.1 > flood.out
+	kill -INFO "$(cat d.pid)"
+	wait_match ' auth=20 unauth=0 full=0 preauth=0 ' cat d.out ||
+	    atf_fail "not counted: $(cat d.out)"
+}
+auth_flood_cleanup()
+{
+	stop
+}
+
+atf_test_case rights cleanup
+rights_head()
+{
+	atf_set "descr" "Started, its descriptors limited to their rights" \
+	    "(cap_rights_limit), and it answers, reads its key and" \
+	    "configuration files again on SIGHUP and logs its counters on" \
+	    "SIGINFO; run by root, the rights as procstat(1) shows them"
+}
+rights_body()
+{
+	umask 077
+	keyfile k1 9
+	keyfile k2 77
+	cp k1 keys
+	printf 'mode stateless\n' > conf
+	P=$(port)
+	start -p $P -K "$(pwd)/keys" -f "$(pwd)/conf"
+	atf_check -o match:'descriptors limited to their rights, not in capability mode' \
+	    cat d.out
+	atf_check -o match:'^len=112 .* seq=5 ' "$S" -p $P -K k1 -q 5 127.0.0.1
+	atf_check -o match:'^len=44 ' "$S" -p $P 127.0.0.1
+	cat k1 k2 > keys
+	printf 'mode stateful\n' > conf
+	kill -HUP "$(cat d.pid)"
+	wait_match 'reloaded: stateful, .*, 2 keys, ' cat d.out ||
+	    atf_fail "not reloaded: $(cat d.out)"
+	atf_check -o match:'^len=112 .* ssid=77 ' "$S" -p $P -K k2 127.0.0.1
+	kill -INFO "$(cat d.pid)"
+	wait_match 'answered=3 dropped: .* sessions=1$' cat d.out ||
+	    atf_fail "no counters: $(cat d.out)"
+	[ "$(id -u)" = 0 ] || return 0
+	# The sockets: receive, send to an address, be waited on (rd and
+	# wr are re and sd); the kqueue, the key file, the directory.
+	procstat -Cf "$(cat d.pid)" > fds
+	n=1
+	has_inet6 && n=2
+	atf_check -o inline:"$n\n" grep -c ' rd,wr,co,ev,re,sd ' fds
+	atf_check -o match:' ke,kc ' -o match:' rd,se,fs,prd,re ' \
+	    -o match:' rd,fc,fs,lo,re ' cat fds
+}
+rights_cleanup()
+{
+	stop
+}
+
 atf_test_case stats cleanup
 stats_head()
 {
@@ -797,7 +889,7 @@ stats_body()
 	atf_check -s exit:2 -o inline:'none\n' "$S" -p $P -l 43 -W 0.5 \
 	    127.0.0.1
 	kill -INFO "$(cat d.pid)"
-	wait_match 'answered=2 dropped: short=1 port=0 rate=0 nomem=0 auth=0 unauth=0 full=0 tlv_failed=0 sessions=1$' \
+	wait_match 'answered=2 dropped: short=1 port=0 rate=0 nomem=0 auth=0 unauth=0 full=0 preauth=0 tlv_failed=0 sessions=1$' \
 	    cat d.out || atf_fail "no counters: $(cat d.out)"
 	atf_check -o match:'^len=44 ' "$S" -p $P 127.0.0.1
 	kill -USR1 "$(cat d.pid)"
@@ -835,5 +927,7 @@ atf_init_test_cases()
 	atf_add_test_case dm_location
 	atf_add_test_case auth
 	atf_add_test_case auth_keys
+	atf_add_test_case auth_flood
+	atf_add_test_case rights
 	atf_add_test_case stats
 }

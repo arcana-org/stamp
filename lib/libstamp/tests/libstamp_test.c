@@ -12,12 +12,59 @@
 #include <arpa/inet.h>
 
 #include <atf-c.h>
+#include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
 
 #include "stamp.h"
+
+/*
+ * pread(2) as a case makes it, libstamp's calls bound to this one: the
+ * system's, an error, a short read (the first line, then the end), or
+ * the file at pread_grow grown by a line while it is read.
+ */
+static enum { PR_SYS, PR_EIO, PR_SHORT, PR_GROW } pread_how;
+static const char *pread_grow;
+
+ssize_t
+pread(int fd, void *buf, size_t len, off_t off)
+{
+	static ssize_t	(*sys)(int, void *, size_t, off_t);
+	static const char line[] = "9 202122232425262728292a2b2c2d2e2f\n";
+	const char	*nl;
+	ssize_t		 r;
+	int		 a;
+
+	if (sys == NULL)
+		sys = (ssize_t (*)(int, void *, size_t, off_t))dlsym(RTLD_NEXT,
+		    "pread");
+	switch (pread_how) {
+	case PR_EIO:
+		errno = EIO;
+		return (-1);
+	case PR_SHORT:
+		if (off > 0)
+			return (0);
+		if ((r = sys(fd, buf, len, off)) > 0 && (nl = memchr(buf, '\n',
+		    (size_t)r)) != NULL)
+			r = nl + 1 - (const char *)buf;
+		return (r);
+	case PR_GROW:
+		r = sys(fd, buf, len, off);
+		ATF_REQUIRE((a = open(pread_grow, O_WRONLY | O_APPEND)) != -1);
+		ATF_REQUIRE(write(a, line, sizeof(line) - 1) ==
+		    (ssize_t)sizeof(line) - 1);
+		close(a);
+		return (r);
+	default:
+		return (sys(fd, buf, len, off));
+	}
+}
 
 static struct sockaddr_in
 sin4(const char *a, uint16_t port)
@@ -2052,6 +2099,11 @@ ATF_TC_BODY(auth_keys, tc)
 	ATF_REQUIRE(stamp_refl_setconf(r, &rc) == 0);
 	ATF_REQUIRE((n = auth_send(s, r, 4, 0, p, &plen, out, &why)) == 112);
 	ATF_CHECK(stamp_sender_reply(s, out, (size_t)n, 4.001, NULL, &sm) == 1);
+	/* Its SSID's wrong, one for any right: answered. */
+	two[1] = any;
+	ATF_REQUIRE(stamp_refl_setconf(r, &rc) == 0);
+	ATF_REQUIRE((n = auth_send(s, r, 4.5, 0, p, &plen, out, &why)) == 112);
+	ATF_CHECK(stamp_sender_reply(s, out, (size_t)n, 4.501, NULL, &sm) == 1);
 	rc.keys = &any;
 	rc.nkeys = 1;
 	ATF_REQUIRE(stamp_refl_setconf(r, &rc) == 0);
@@ -2070,6 +2122,246 @@ ATF_TC_BODY(auth_keys, tc)
 	stamp_sender_free(s);
 	stamp_sender_free(su);
 	stamp_refl_free(r);
+}
+
+/*
+ * A reflector's keys: STAMP_KEYS_SSID_MAX an SSID and STAMP_KEYS_ANY_MAX
+ * for any at most, else refused and nothing changed; a request's SSID's
+ * found among thousands, its keys tried in the order they came, the
+ * right one last of four; one for any tried when its SSID has none, or
+ * when its SSID's fail.  A key file the same, its line said.  (The
+ * HMACs a request costs are not counted in the stats: the bound is the
+ * refusals'.)
+ */
+ATF_TC_WITHOUT_HEAD(auth_keys_index);
+ATF_TC_BODY(auth_keys_index, tc)
+{
+	struct stamp_key	 *many, five[5], bad;
+	struct stamp_sender_conf  c = { .timeout = 1 };
+	struct stamp_refl_conf	  rc = { .port = 862 };
+	struct stamp_sender	 *s;
+	struct stamp_refl	 *r;
+	struct stamp_key	 *k;
+	enum stamp_drop		  why;
+	uint8_t			  p[STAMP_PKT_MAX], out[STAMP_PKT_MAX];
+	char			  text[512], w[256] = "";
+	size_t			  plen, i, n;
+
+	/* 4092 SSIDs, from 60000 down by tens, then 4 for any. */
+	ATF_REQUIRE((many = calloc(STAMP_KEYS_MAX, sizeof(*many))) != NULL);
+	for (i = 0; i < STAMP_KEYS_MAX - STAMP_KEYS_ANY_MAX; i++)
+		many[i] = key_make((int32_t)(60000 - 10 * i), (uint8_t)i);
+	for (; i < STAMP_KEYS_MAX; i++)
+		many[i] = key_make(STAMP_SSID_ANY, (uint8_t)(200 + i));
+	rc.keys = many;
+	rc.nkeys = STAMP_KEYS_MAX;
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	c.ssid = 60000 - 10 * 1234;
+	c.key = &many[1234];
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_CHECK(auth_send(s, r, 1, 0, p, &plen, out, &why) == 112);
+	stamp_sender_free(s);
+	/* Another key of an SSID that has one: dropped. */
+	c.key = &many[1235];
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_CHECK(auth_send(s, r, 2, 0, p, &plen, out, &why) == -1 &&
+	    why == STAMP_DROP_AUTH);
+	stamp_sender_free(s);
+	/* The last for any: for an SSID of none, and for one of its own. */
+	c.key = &many[STAMP_KEYS_MAX - 1];
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_CHECK(auth_send(s, r, 3, 0, p, &plen, out, &why) == 112);
+	stamp_sender_free(s);
+	c.ssid = 5;
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_CHECK(auth_send(s, r, 4, 0, p, &plen, out, &why) == 112);
+	/* A fifth for any, a fifth for an SSID, an SSID past 65535:
+	 * refused, the keys as they were. */
+	for (i = 0; i < 5; i++)
+		five[i] = key_make(STAMP_SSID_ANY, (uint8_t)i);
+	rc.keys = five;
+	rc.nkeys = 5;
+	ATF_CHECK(stamp_refl_setconf(r, &rc) == -1 && errno == E2BIG);
+	ATF_CHECK(stamp_refl_new(&rc) == NULL && errno == E2BIG);
+	for (i = 0; i < 5; i++)
+		five[i] = key_make(7, (uint8_t)(i + 1));
+	ATF_CHECK(stamp_refl_setconf(r, &rc) == -1 && errno == E2BIG);
+	ATF_CHECK(stamp_refl_new(&rc) == NULL && errno == E2BIG);
+	bad = key_make(70000, 1);
+	rc.keys = &bad;
+	rc.nkeys = 1;
+	ATF_CHECK(stamp_refl_setconf(r, &rc) == -1 && errno == EINVAL);
+	ATF_CHECK(auth_send(s, r, 5, 0, p, &plen, out, &why) == 112);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+	free(many);
+
+	/* Four for SSID 7 among others, the right one last: answered. */
+	for (i = 0; i < 4; i++)
+		five[i] = key_make(7, (uint8_t)(i + 1));
+	five[4] = key_make(6, 9);
+	rc.keys = five;
+	rc.nkeys = 5;
+	ATF_REQUIRE((r = stamp_refl_new(&rc)) != NULL);
+	c.ssid = 7;
+	c.key = &five[3];
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_CHECK(auth_send(s, r, 6, 0, p, &plen, out, &why) == 112);
+	stamp_sender_free(s);
+	/* A fifth key of none of them: dropped. */
+	five[4] = key_make(7, 9);
+	c.key = &five[4];
+	ATF_REQUIRE((s = stamp_sender_new(&c)) != NULL);
+	ATF_CHECK(auth_send(s, r, 7, 0, p, &plen, out, &why) == -1 &&
+	    why == STAMP_DROP_AUTH);
+	stamp_sender_free(s);
+	stamp_refl_free(r);
+
+	/* A file: four keys for an SSID taken, a fifth refused, a fifth
+	 * for any refused. */
+	text[0] = '\0';
+	for (i = 0; i < 5; i++)
+		strlcat(text, "7 000102030405060708090a0b0c0d0e0f\n",
+		    sizeof(text));
+	ATF_CHECK(stamp_keys_parse(text, strlen(text), &k, &n, w,
+	    sizeof(w)) == -1);
+	ATF_CHECK_MSG(strstr(w, "line 5: more than 4 keys for SSID 7") != NULL,
+	    "%s", w);
+	ATF_CHECK(stamp_keys_parse(text, strlen(text) - 35, &k, &n, w,
+	    sizeof(w)) == 0 && n == 4);
+	stamp_keys_free(k, n);
+	text[0] = '\0';
+	for (i = 0; i < 5; i++)
+		strlcat(text, "* 000102030405060708090a0b0c0d0e0f\n",
+		    sizeof(text));
+	ATF_CHECK(stamp_keys_parse(text, strlen(text), &k, &n, w,
+	    sizeof(w)) == -1);
+	ATF_CHECK_MSG(strstr(w, "line 5: more than 4 keys for any SSID") !=
+	    NULL, "%s", w);
+	ATF_CHECK(stamp_keys_parse(text, strlen(text) - 35, &k, &n, w,
+	    sizeof(w)) == 0 && n == 4);
+	stamp_keys_free(k, n);
+}
+
+/*
+ * Before any HMAC, a request of the authenticated layout draws from its
+ * source's bucket of its own (STAMP_DROP_PREAUTH when empty), given
+ * back when the HMAC verifies: failures from a source cost the HMACs of
+ * its rate, the requests answered never use it up.  Failures written
+ * from a sender's address starve its authenticated requests as its
+ * unauthenticated ones would be, while they last; its unauthenticated
+ * requests, and another source's, untouched.  No limit to a source:
+ * none.
+ */
+ATF_TC_WITHOUT_HEAD(reflect_preauth);
+ATF_TC_BODY(reflect_preauth, tc)
+{
+	struct stamp_key	  k = key_make(7, 1), other = key_make(7, 2);
+	struct stamp_sender_conf  sc = { .ssid = 7, .key = &k };
+	struct stamp_sender_conf  oc = { .ssid = 7, .key = &other };
+	struct stamp_refl_conf	  c = { .rate = 2, .burst = 4, .port = 862,
+	    .keys = &k, .nkeys = 1 };
+	struct sockaddr_in	  a = sin4("192.0.2.1", 40000);	/* auth_send's */
+	struct sockaddr_in	  b = sin4("192.0.2.9", 40000);
+	struct stamp_sender	 *s, *so;
+	struct stamp_refl	 *r;
+	struct stamp_refl_stats	  st;
+	enum stamp_drop		  why;
+	uint8_t			  p[STAMP_PKT_MAX], q[STAMP_PKT_MAX];
+	uint8_t			  out[STAMP_PKT_MAX];
+	size_t			  plen;
+	int			  i, ans, preauth;
+
+	ATF_REQUIRE((s = stamp_sender_new(&sc)) != NULL);
+	ATF_REQUIRE((so = stamp_sender_new(&oc)) != NULL);
+	ATF_REQUIRE((r = stamp_refl_new(&c)) != NULL);
+	/* Its own, past its rate: over the rate after the HMAC, never
+	 * before it. */
+	for (i = ans = 0; i < 10; i++)
+		if (auth_send(s, r, 100, 0, q, &plen, out, &why) > 0)
+			ans++;
+		else
+			ATF_CHECK_EQ(why, STAMP_DROP_RATE);
+	ATF_CHECK_EQ(ans, 4);
+	/* Failures from its address: the burst's 4 cost an HMAC each, the
+	 * others none. */
+	for (i = preauth = 0; i < 10; i++) {
+		ATF_CHECK(auth_send(so, r, 101, 0, q, &plen, out, &why) == -1);
+		if (why == STAMP_DROP_PREAUTH)
+			preauth++;
+		else
+			ATF_CHECK_EQ(why, STAMP_DROP_AUTH);
+	}
+	ATF_CHECK_EQ(preauth, 6);
+	/* Its own meanwhile, as its unauthenticated ones would be; those
+	 * answered, from their bucket; another source's answered. */
+	ATF_CHECK(auth_send(s, r, 101, 0, q, &plen, out, &why) == -1 &&
+	    why == STAMP_DROP_PREAUTH);
+	pkt_make(p, 44, 1, 7);
+	ATF_CHECK(reply(r, p, 44, (struct sockaddr *)&a, NULL, 0, 101, out,
+	    NULL) == 44);
+	ATF_CHECK(auth_send(s, NULL, 101, 0, q, &plen, out, NULL) == 0);
+	ATF_CHECK(reply(r, q, plen, (struct sockaddr *)&b, NULL, 0, 101, out,
+	    &why) == (ssize_t)plen);
+	/* A second on, a token again: its own answered. */
+	ATF_CHECK(auth_send(s, r, 102, 0, q, &plen, out, &why) > 0);
+	/* No limit to a source: failures all cost an HMAC. */
+	c.rate = 0;
+	ATF_REQUIRE(stamp_refl_setconf(r, &c) == 0);
+	for (i = 0; i < 10; i++)
+		ATF_CHECK(auth_send(so, r, 103, 0, q, &plen, out, &why) == -1 &&
+		    why == STAMP_DROP_AUTH);
+	stamp_refl_stats(r, &st);
+	ATF_CHECK_EQ(st.dropped[STAMP_DROP_PREAUTH], 6 + 1);
+	ATF_CHECK_EQ(st.dropped[STAMP_DROP_AUTH], 4 + 10);
+	stamp_sender_free(s);
+	stamp_sender_free(so);
+	stamp_refl_free(r);
+}
+
+/*
+ * A key file read whole or not at all: an error reading it, a read
+ * short of its size, or the file grown while it is read, refused and
+ * said, never a smaller set of keys.
+ */
+ATF_TC_WITHOUT_HEAD(auth_keyfile_read);
+ATF_TC_BODY(auth_keyfile_read, tc)
+{
+	static const char	 two[] =
+	    "7 000102030405060708090a0b0c0d0e0f\n"
+	    "8 101112131415161718191a1b1c1d1e1f\n";
+	struct stamp_key	*k;
+	size_t			 n;
+	char			 why[256] = "", path[] = "keys.XXXXXX";
+	int			 fd;
+
+	ATF_REQUIRE((fd = mkstemp(path)) != -1);
+	ATF_REQUIRE(write(fd, two, sizeof(two) - 1) == sizeof(two) - 1);
+	ATF_REQUIRE(fchmod(fd, 0600) == 0);
+	ATF_REQUIRE(stamp_keys_read(fd, &k, &n, why, sizeof(why)) == 0);
+	ATF_CHECK_EQ(n, 2);
+	stamp_keys_free(k, n);
+	pread_how = PR_EIO;
+	ATF_CHECK(stamp_keys_read(fd, &k, &n, why, sizeof(why)) == -1);
+	ATF_CHECK(k == NULL && n == 0);
+	ATF_CHECK_MSG(strstr(why, strerror(EIO)) != NULL, "%s", why);
+	/* Its first line, then nothing: a smaller set, refused. */
+	pread_how = PR_SHORT;
+	ATF_CHECK(stamp_keys_read(fd, &k, &n, why, sizeof(why)) == -1);
+	ATF_CHECK_MSG(strstr(why, "35 of its 70 octets read") != NULL, "%s",
+	    why);
+	pread_how = PR_GROW;
+	pread_grow = path;
+	ATF_CHECK(stamp_keys_read(fd, &k, &n, why, sizeof(why)) == -1);
+	ATF_CHECK_MSG(strstr(why, "changed while it was read") != NULL, "%s",
+	    why);
+	/* Read again, whole: the line it grew by too. */
+	pread_how = PR_SYS;
+	ATF_REQUIRE(stamp_keys_read(fd, &k, &n, why, sizeof(why)) == 0);
+	ATF_CHECK_EQ(n, 3);
+	stamp_keys_free(k, n);
+	close(fd);
+	unlink(path);
 }
 
 ATF_TC_WITHOUT_HEAD(auth_keyfile);
@@ -2138,7 +2430,10 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, auth_tamper);
 	ATF_TP_ADD_TC(tp, auth_tlv_strict);
 	ATF_TP_ADD_TC(tp, auth_keys);
+	ATF_TP_ADD_TC(tp, auth_keys_index);
+	ATF_TP_ADD_TC(tp, reflect_preauth);
 	ATF_TP_ADD_TC(tp, auth_keyfile);
+	ATF_TP_ADD_TC(tp, auth_keyfile_read);
 
 	ATF_TP_ADD_TC(tp, tlv_cos);
 	ATF_TP_ADD_TC(tp, tlv_dm);
